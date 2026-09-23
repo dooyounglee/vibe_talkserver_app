@@ -4,8 +4,26 @@ const WebSocket = require('ws');
 // 포트 8080에서 서버 실행
 const wss = new WebSocket.Server({ port: 8080 });
 
-// 클라이언트별 닉네임 저장
+// 클라이언트별 닉네임 저장 (WebSocket 인스턴스 -> 닉네임)
 const clients = new Map();
+
+// 모든 클라이언트에게 메시지 브로드캐스트
+function broadcast(message) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(message));
+    }
+  });
+}
+
+// 현재 접속 중인 사용자 목록을 전체 클라이언트에게 전송
+function broadcastUserList() {
+  const userList = Array.from(clients.values());
+  broadcast({
+    type: "userlist",
+    users: userList
+  });
+}
 
 // 새로운 클라이언트 연결 시
 wss.on('connection', (ws) => {
@@ -27,6 +45,56 @@ wss.on('connection', (ws) => {
           type: 'system',
           text: `${nickname}님이 입장했습니다`
         });
+        
+        // 사용자 목록 업데이트 및 전송
+        broadcastUserList();
+      }
+      
+      // DM 메시지 처리: 1:1 메시지 전송
+      else if (data.type === 'dm') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        
+        const targetNickname = data.to;
+        const text = data.text;
+        
+        // 대상 클라이언트 찾기
+        let targetClient = null;
+        for (const [client, nickname] of clients.entries()) {
+          if (nickname === targetNickname) {
+            targetClient = client;
+            break;
+          }
+        }
+        
+        // 대상 클라이언트가 존재하는 경우
+        if (targetClient) {
+          // 대상 클라이언트에게 메시지 전송
+          targetClient.send(JSON.stringify({
+            type: "dm",
+            from: senderNickname,
+            to: targetNickname,
+            text: text,
+            timestamp: Date.now()
+          }));
+          
+          // 보낸 사람에게도 동일한 메시지 전송
+          ws.send(JSON.stringify({
+            type: "dm",
+            from: senderNickname,
+            to: targetNickname,
+            text: text,
+            timestamp: Date.now()
+          }));
+        } 
+        // 대상 클라이언트가 없는 경우
+        else {
+          // 보낸 사람에게 시스템 메시지 전송
+          ws.send(JSON.stringify({
+            type: "system",
+            text: `${targetNickname}님은 접속 중이 아닙니다`
+          }));
+        }
       }
       
       // MESSAGE 메시지 처리: 채팅 브로드캐스트
@@ -49,7 +117,7 @@ wss.on('connection', (ws) => {
       console.error('메시지 파싱 오류:', e);
     }
   });
-
+  
   // 클라이언트 연결 종료 시
   ws.on('close', () => {
     const nickname = clients.get(ws);
@@ -62,15 +130,9 @@ wss.on('connection', (ws) => {
         type: 'system',
         text: `${nickname}님이 퇴장했습니다`
       });
+      
+      // 사용자 목록 업데이트 및 전송
+      broadcastUserList();
     }
   });
 });
-
-// 모든 클라이언트에게 메시지 브로드캐스트
-function broadcast(message) {
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(message));
-    }
-  });
-}
