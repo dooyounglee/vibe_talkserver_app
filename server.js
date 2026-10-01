@@ -1,6 +1,9 @@
 // WebSocket 채팅 서버 생성
 const WebSocket = require('ws');
 
+// SQLite 데이터베이스 (메시지 저장)
+const { saveMessage } = require('./db');
+
 // 포트 8080에서 서버 실행
 const wss = new WebSocket.Server({ port: 8080 });
 
@@ -86,6 +89,15 @@ wss.on('connection', (ws) => {
             text: text,
             timestamp: Date.now()
           }));
+
+          // DB에 메시지 저장 (1:1 채팅)
+          saveMessage({
+            roomType: 'dm',
+            sender: senderNickname,
+            receiver: targetNickname,
+            text: text,
+            timestamp: Date.now()
+          });
         } 
         // 대상 클라이언트가 없는 경우
         else {
@@ -112,6 +124,15 @@ wss.on('connection', (ws) => {
         // 모든 클라이언트에게 메시지 전송
         broadcast(messageData);
         console.log(`${senderNickname}: ${data.text}`);
+
+        // DB에 메시지 저장 (전체 채팅)
+        saveMessage({
+          roomType: 'group',
+          sender: senderNickname,
+          receiver: null,
+          text: data.text,
+          timestamp: messageData.timestamp
+        });
       }
     } catch (e) {
       console.error('메시지 파싱 오류:', e);
