@@ -1,8 +1,8 @@
 // WebSocket 채팅 서버 생성
 const WebSocket = require('ws');
 
-// SQLite 데이터베이스 (메시지 저장)
-const { saveMessage } = require('./db');
+// SQLite 데이터베이스 (메시지 저장/조회)
+const { db, saveMessage } = require('./db');
 
 // 포트 8080에서 서버 실행
 const wss = new WebSocket.Server({ port: 8080 });
@@ -28,6 +28,57 @@ function broadcastUserList() {
   });
 }
 
+// 그룹 채팅 기록 조회 (최근 limit개를 시간순 오름차순으로 반환)
+function getRecentGroupHistory(limit = 50) {
+  const rows = db.prepare(
+    `SELECT sender, text, timestamp FROM messages
+     WHERE room_type = 'group'
+     ORDER BY timestamp DESC, id DESC
+     LIMIT ?`
+  ).all(limit);
+
+  // DESC로 가져온 결과를 뒤집어 오래된 것부터(시간순) 정렬
+  return rows.reverse().map(row => ({
+    nickname: row.sender,
+    text: row.text,
+    timestamp: row.timestamp
+  }));
+}
+
+// 특정 닉네임과 관련된 DM 기록을 상대방별로 그룹화해 반환
+// 각 상대방마다 최근 limit개를 시간순 오름차순으로 정리
+function getRecentDmHistories(nickname, limit = 50) {
+  const rows = db.prepare(
+    `SELECT sender, receiver, text, timestamp FROM messages
+     WHERE room_type = 'dm' AND (sender = ? OR receiver = ?)
+     ORDER BY timestamp ASC, id ASC`
+  ).all(nickname, nickname);
+
+  // 상대방 닉네임별로 메시지 그룹화
+  const byUser = new Map();
+  for (const row of rows) {
+    const counterpart = row.sender === nickname ? row.receiver : row.sender;
+    if (!byUser.has(counterpart)) {
+      byUser.set(counterpart, []);
+    }
+    byUser.get(counterpart).push({
+      nickname: row.sender,
+      text: row.text,
+      timestamp: row.timestamp
+    });
+  }
+
+  // 상대방별 최근 limit개만 추출
+  const histories = [];
+  for (const [withUser, messages] of byUser.entries()) {
+    histories.push({
+      withUser: withUser,
+      messages: messages.slice(-limit)
+    });
+  }
+  return histories;
+}
+
 // 새로운 클라이언트 연결 시
 wss.on('connection', (ws) => {
   console.log('새로운 클라이언트가 연결됨');
@@ -51,6 +102,21 @@ wss.on('connection', (ws) => {
         
         // 사용자 목록 업데이트 및 전송
         broadcastUserList();
+
+        // 추가: 그룹 채팅 기록 전송 (방금 접속한 클라이언트에게만)
+        ws.send(JSON.stringify({
+          type: 'history_group',
+          messages: getRecentGroupHistory(50)
+        }));
+
+        // 추가: 이 닉네임과 관련된 DM 기록을 상대방별로 전송 (방금 접속한 클라이언트에게만)
+        for (const history of getRecentDmHistories(nickname, 50)) {
+          ws.send(JSON.stringify({
+            type: 'history_dm',
+            withUser: history.withUser,
+            messages: history.messages
+          }));
+        }
       }
       
       // DM 메시지 처리: 1:1 메시지 전송
