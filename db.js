@@ -41,6 +41,17 @@ db.exec(`
   )
 `);
 
+// ─── 등록 사용자 (users) ───
+// join 시 자동 등록, 탈퇴(is_deleted=1) 제외하고 목록에 노출
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    nickname TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    deleted_at INTEGER NULL
+  )
+`);
+
 // 기존 DB 마이그레이션: messages.room_id 컬럼 추가 (이미 있으면 무시)
 try {
   const cols = db.prepare(`PRAGMA table_info(messages)`).all();
@@ -73,13 +84,29 @@ function saveMessage({ roomType, sender, receiver = null, text, timestamp, roomI
 
 // ─── 번호방 CRUD ───
 
-function createRoom({ name, owner, timestamp }) {
+function createRoom({ name, owner, timestamp, members = [] }) {
   const info = db
     .prepare(`INSERT INTO rooms (name, owner, created_at) VALUES (?, ?, ?)`)
     .run(name, owner, timestamp);
   const roomId = Number(info.lastInsertRowid);
   db.prepare(`INSERT INTO room_members (room_id, nickname, joined_at) VALUES (?, ?, ?)`)
     .run(roomId, owner, timestamp);
+  // 초대 멤버를 함께 등록 (중복/방장 제외, 빈 문자열 제외)
+  const seen = new Set([owner]);
+  let seq = 1;
+  for (const raw of Array.isArray(members) ? members : []) {
+    const nick = String(raw || '').trim();
+    if (!nick || seen.has(nick)) continue;
+    seen.add(nick);
+    try {
+      db.prepare(
+        `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at) VALUES (?, ?, ?)`
+      ).run(roomId, nick, timestamp + seq);
+      seq += 1;
+    } catch {
+      // 무시 (개별 멤버 추가 실패가 방 생성을 막지 않음)
+    }
+  }
   return roomId;
 }
 
@@ -188,6 +215,54 @@ function getRoomHistory(roomId, limit = 50) {
   }));
 }
 
+// ─── 등록 사용자 (users) ───
+// join 시 자동 등록. 목록은 탈퇴(is_deleted=1) 제외.
+function upsertUser(nickname, timestamp) {
+  const nick = String(nickname || '').trim();
+  if (!nick) return;
+  const ts = Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now();
+  db.prepare(
+    `INSERT INTO users (nickname, created_at, is_deleted, deleted_at)
+     VALUES (?, ?, 0, NULL)
+     ON CONFLICT(nickname) DO UPDATE SET is_deleted = 0, deleted_at = NULL`
+  ).run(nick, ts);
+}
+
+function withdrawUser(nickname, timestamp) {
+  const nick = String(nickname || '').trim();
+  if (!nick) return;
+  const ts = Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now();
+  db.prepare(
+    `UPDATE users SET is_deleted = 1, deleted_at = ? WHERE nickname = ?`
+  ).run(ts, nick);
+}
+
+function isWithdrawn(nickname) {
+  const nick = String(nickname || '').trim();
+  if (!nick) return false;
+  const row = db
+    .prepare(`SELECT is_deleted FROM users WHERE nickname = ?`)
+    .get(nick);
+  return !!row && Number(row.is_deleted) === 1;
+}
+
+function isRegistered(nickname) {
+  const nick = String(nickname || '').trim();
+  if (!nick) return false;
+  const row = db
+    .prepare(`SELECT 1 AS ok FROM users WHERE nickname = ? AND is_deleted = 0`)
+    .get(nick);
+  return !!row;
+}
+
+// 등록된 전체 사용자 (탈퇴 제외, 닉네임 오름차순)
+function getAllUsers() {
+  return db
+    .prepare(`SELECT nickname FROM users WHERE is_deleted = 0 ORDER BY nickname ASC`)
+    .all()
+    .map((r) => r.nickname);
+}
+
 module.exports = {
   db,
   saveMessage,
@@ -205,4 +280,9 @@ module.exports = {
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
+  upsertUser,
+  withdrawUser,
+  isWithdrawn,
+  isRegistered,
+  getAllUsers,
 };

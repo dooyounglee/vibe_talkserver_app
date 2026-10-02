@@ -18,6 +18,11 @@ const {
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
+  upsertUser,
+  withdrawUser,
+  isWithdrawn,
+  isRegistered,
+  getAllUsers,
 } = require('./db');
 
 // 포트 8080에서 서버 실행
@@ -64,12 +69,15 @@ function broadcastToRoom(roomId, message) {
   });
 }
 
-// 현재 접속 중인 사용자 목록을 전체 클라이언트에게 전송
+// 등록된 전체 사용자 목록 + 현재 접속중 목록을 전체 클라이언트에게 전송
+// users: DB 등록 사용자 전체 (탈퇴 제외), onlineUsers: 현재 접속중
 function broadcastUserList() {
-  const userList = Array.from(clients.values());
+  const onlineUsers = Array.from(clients.values());
+  const users = getAllUsers();
   broadcast({
     type: "userlist",
-    users: userList
+    users,
+    onlineUsers,
   });
 }
 
@@ -123,6 +131,8 @@ wss.on('connection', (ws) => {
       if (data.type === 'join') {
         const nickname = String(data.nickname || '').trim();
         if (!nickname) return;
+        // 등록 사용자에 자동 등록 (탈퇴 상태면 복구)
+        upsertUser(nickname, Date.now());
         clients.set(ws, nickname);
         console.log(`${nickname} 닉네임으로 입장`);
 
@@ -162,14 +172,41 @@ wss.on('connection', (ws) => {
         }
       }
       
-      // DM 메시지 처리: 1:1 메시지 전송
+      // DM 메시지 처리: 1:1 메시지 전송 (오프라인 포함 — DB 저장 후 접속 시 history로 수신)
       else if (data.type === 'dm') {
         const senderNickname = clients.get(ws);
         if (!senderNickname) return;
         
-        const targetNickname = data.to;
-        const text = data.text;
-        
+        const targetNickname = String(data.to || '').trim();
+        const text = String(data.text || '').trim();
+        if (!targetNickname || !text) return;
+        // 탈퇴한 사용자와는 DM 불가
+        if (isWithdrawn(senderNickname) || isWithdrawn(targetNickname)) {
+          ws.send(JSON.stringify({
+            type: "system",
+            text: `탈퇴한 사용자와는 대화할 수 없습니다`
+          }));
+          return;
+        }
+        // 수신자가 등록된 사용자가 아니면 차단
+        if (!isRegistered(targetNickname)) {
+          ws.send(JSON.stringify({
+            type: "system",
+            text: `${targetNickname}님은 등록된 사용자가 아닙니다`
+          }));
+          return;
+        }
+
+        const now = Date.now();
+        // DB에 메시지 저장 (1:1 채팅, 오프라인 포함)
+        saveMessage({
+          roomType: 'dm',
+          sender: senderNickname,
+          receiver: targetNickname,
+          text: text.slice(0, 2000),
+          timestamp: now
+        });
+
         // 대상 클라이언트 찾기
         let targetClient = null;
         for (const [client, nickname] of clients.entries()) {
@@ -178,42 +215,32 @@ wss.on('connection', (ws) => {
             break;
           }
         }
-        
-        // 대상 클라이언트가 존재하는 경우
-        if (targetClient) {
-          // 대상 클라이언트에게 메시지 전송
+
+        // 대상이 온라인이면 실시간 전송
+        if (targetClient && targetClient.readyState === WebSocket.OPEN) {
           targetClient.send(JSON.stringify({
             type: "dm",
             from: senderNickname,
             to: targetNickname,
-            text: text,
-            timestamp: Date.now()
+            text: text.slice(0, 2000),
+            timestamp: now
           }));
-          
-          // 보낸 사람에게도 동일한 메시지 전송
-          ws.send(JSON.stringify({
-            type: "dm",
-            from: senderNickname,
-            to: targetNickname,
-            text: text,
-            timestamp: Date.now()
-          }));
+        }
 
-          // DB에 메시지 저장 (1:1 채팅)
-          saveMessage({
-            roomType: 'dm',
-            sender: senderNickname,
-            receiver: targetNickname,
-            text: text,
-            timestamp: Date.now()
-          });
-        } 
-        // 대상 클라이언트가 없는 경우
-        else {
-          // 보낸 사람에게 시스템 메시지 전송
+        // 보낸 사람에게도 에코 (내 창에 표시용)
+        ws.send(JSON.stringify({
+          type: "dm",
+          from: senderNickname,
+          to: targetNickname,
+          text: text.slice(0, 2000),
+          timestamp: now
+        }));
+
+        // 대상이 오프라인이면 안내 (다음 접속 시 history_dm으로 수신됨)
+        if (!targetClient) {
           ws.send(JSON.stringify({
             type: "system",
-            text: `${targetNickname}님은 접속 중이 아닙니다`
+            text: `${targetNickname}님은 오프라인입니다. 메시지는 저장되어 다음 접속 시 전달됩니다`
           }));
         }
       }
@@ -223,7 +250,7 @@ wss.on('connection', (ws) => {
       else if (data.type === 'message') {
         return;
       }
-      // ─── 번호방: 생성 ───
+      // ─── 번호방: 생성 (초대 멤버 포함 가능) ───
       else if (data.type === 'room_create') {
         const senderNickname = clients.get(ws);
         if (!senderNickname) return;
@@ -232,16 +259,42 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'system', text: '방 이름을 입력하세요.' }));
           return;
         }
+        // 초대생성: members 배열(닉네임 목록)을 함께 받아 방 생성 시 멤버로 등록
+        // 탈퇴한 사용자는 초대 대상에서 제외
+        const rawMembers = Array.isArray(data.members) ? data.members : [];
+        const members = rawMembers
+          .map((m) => String(m || '').trim())
+          .filter((m) => m && m !== senderNickname && !isWithdrawn(m))
+          .slice(0, 50);
         const now = Date.now();
-        const roomId = createRoom({ name, owner: senderNickname, timestamp: now });
+        const roomId = createRoom({ name, owner: senderNickname, timestamp: now, members });
         trackJoin(ws, roomId);
-        console.log(`방 생성 #${roomId} "${name}" by ${senderNickname}`);
+        console.log(`방 생성 #${roomId} "${name}" by ${senderNickname} (초대 ${members.length}명)`);
         ws.send(JSON.stringify({
           type: 'room_created',
           roomId,
           rooms: getMyRooms(senderNickname),
         }));
         ws.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
+        broadcastToRoom(roomId, {
+          type: 'room_members', roomId, members: getRoomMembers(roomId),
+        });
+        // 초대받은 온라인 멤버에게 내 방 목록 + 빈 히스토리 즉시 푸시
+        // (다음 join/재접속 때까지 기다리지 않고 바로 목록에 뜨게 함)
+        if (members.length > 0) {
+          wss.clients.forEach((client) => {
+            if (client === ws) return;
+            if (client.readyState !== WebSocket.OPEN) return;
+            const nick = clients.get(client);
+            if (!nick || !members.includes(nick)) return;
+            trackJoin(client, roomId);
+            client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(nick) }));
+            client.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
+            client.send(JSON.stringify({
+              type: 'room_members', roomId, members: getRoomMembers(roomId),
+            }));
+          });
+        }
       }
       // ─── 번호방: 입장 ───
       else if (data.type === 'room_join') {
