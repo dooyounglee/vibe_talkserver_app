@@ -42,7 +42,8 @@ db.exec(`
 `);
 
 // ─── 등록 사용자 (users) ───
-// join 시 자동 등록, 탈퇴(is_deleted=1) 제외하고 목록에 노출
+// admin이 직접 추가/수정. join 시 자동 등록하지 않음 (요구사항 4).
+// 목록은 탈퇴(is_deleted=1) 제외 (일반 사용자용), 관리는 전체 조회 사용.
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     nickname TEXT PRIMARY KEY,
@@ -51,6 +52,16 @@ db.exec(`
     deleted_at INTEGER NULL
   )
 `);
+
+// 'admin' 사용자 시드 (없으면 생성, 있으면 유지)
+try {
+  db.prepare(
+    `INSERT OR IGNORE INTO users (nickname, created_at, is_deleted, deleted_at)
+     VALUES ('admin', ?, 0, NULL)`
+  ).run(Date.now());
+} catch (e) {
+  console.error('admin 시드 실패:', e);
+}
 
 // 기존 DB 마이그레이션: messages.room_id 컬럼 추가 (이미 있으면 무시)
 try {
@@ -216,16 +227,25 @@ function getRoomHistory(roomId, limit = 50) {
 }
 
 // ─── 등록 사용자 (users) ───
-// join 시 자동 등록. 목록은 탈퇴(is_deleted=1) 제외.
-function upsertUser(nickname, timestamp) {
+// admin이 직접 추가/수정. 목록은 탈퇴(is_deleted=1) 제외.
+function upsertUser(nickname, timestamp, isDeleted = false) {
   const nick = String(nickname || '').trim();
   if (!nick) return;
   const ts = Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now();
-  db.prepare(
-    `INSERT INTO users (nickname, created_at, is_deleted, deleted_at)
-     VALUES (?, ?, 0, NULL)
-     ON CONFLICT(nickname) DO UPDATE SET is_deleted = 0, deleted_at = NULL`
-  ).run(nick, ts);
+  const deleted = isDeleted ? 1 : 0;
+  if (deleted === 1) {
+    db.prepare(
+      `INSERT INTO users (nickname, created_at, is_deleted, deleted_at)
+       VALUES (?, ?, 1, ?)
+       ON CONFLICT(nickname) DO UPDATE SET is_deleted = 1, deleted_at = excluded.deleted_at`
+    ).run(nick, ts, ts);
+  } else {
+    db.prepare(
+      `INSERT INTO users (nickname, created_at, is_deleted, deleted_at)
+       VALUES (?, ?, 0, NULL)
+       ON CONFLICT(nickname) DO UPDATE SET is_deleted = 0, deleted_at = NULL`
+    ).run(nick, ts);
+  }
 }
 
 function withdrawUser(nickname, timestamp) {
@@ -263,6 +283,14 @@ function getAllUsers() {
     .map((r) => r.nickname);
 }
 
+// 관리용 전체 사용자 (탈퇴 포함, 탈퇴여부 함께 반환 — admin 전용 응답에 사용)
+function getAllUsersDetail() {
+  return db
+    .prepare(`SELECT nickname, is_deleted FROM users ORDER BY nickname ASC`)
+    .all()
+    .map((r) => ({ nickname: r.nickname, isDeleted: Number(r.is_deleted) === 1 }));
+}
+
 module.exports = {
   db,
   saveMessage,
@@ -285,4 +313,5 @@ module.exports = {
   isWithdrawn,
   isRegistered,
   getAllUsers,
+  getAllUsersDetail,
 };

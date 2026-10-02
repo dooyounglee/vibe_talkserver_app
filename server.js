@@ -23,6 +23,7 @@ const {
   isWithdrawn,
   isRegistered,
   getAllUsers,
+  getAllUsersDetail,
 } = require('./db');
 
 // 포트 8080에서 서버 실행
@@ -71,6 +72,7 @@ function broadcastToRoom(roomId, message) {
 
 // 등록된 전체 사용자 목록 + 현재 접속중 목록을 전체 클라이언트에게 전송
 // users: DB 등록 사용자 전체 (탈퇴 제외), onlineUsers: 현재 접속중
+// admin 접속자에게는 탈퇴 포함 상세(usersDetail)도 개별 전송
 function broadcastUserList() {
   const onlineUsers = Array.from(clients.values());
   const users = getAllUsers();
@@ -79,6 +81,17 @@ function broadcastUserList() {
     users,
     onlineUsers,
   });
+  // admin에게는 전체(탈퇴 포함) 상세 목록 추가 전송
+  try {
+    const detail = getAllUsersDetail();
+    wss.clients.forEach((client) => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      if (clients.get(client) !== 'admin') return;
+      client.send(JSON.stringify({ type: 'userlist_detail', usersDetail: detail }));
+    });
+  } catch (e) {
+    console.error('admin 상세 목록 전송 실패:', e);
+  }
 }
 
 // 그룹 채팅 기록 조회 — 전체채팅 제거로 더 이상 사용하지 않음 (기존 DB 행은 보존)
@@ -128,11 +141,19 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message.toString());
       
       // JOIN 메시지 처리: 닉네임 설정 및 입장 알림
+      // NOTE: 접속 시 자동 upsert 제거 — 등록된 사용자만 입장 가능 (admin이 사전 등록)
       if (data.type === 'join') {
         const nickname = String(data.nickname || '').trim();
         if (!nickname) return;
-        // 등록 사용자에 자동 등록 (탈퇴 상태면 복구)
-        upsertUser(nickname, Date.now());
+        // 미등록/탈퇴 사용자는 입장 거부
+        if (isWithdrawn(nickname)) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'withdrawn', text: `${nickname}님은 탈퇴한 사용자입니다` }));
+          return;
+        }
+        if (!isRegistered(nickname)) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'not_registered', text: `${nickname}님은 등록된 사용자가 아닙니다. 관리자에게 문의하세요` }));
+          return;
+        }
         clients.set(ws, nickname);
         console.log(`${nickname} 닉네임으로 입장`);
 
@@ -170,6 +191,32 @@ wss.on('connection', (ws) => {
             messages: history.messages
           }));
         }
+
+        // admin 접속 시 관리용 전체 목록(탈퇴 포함)도 전송
+        if (nickname === 'admin') {
+          ws.send(JSON.stringify({ type: 'userlist_detail', usersDetail: getAllUsersDetail() }));
+        }
+      }
+
+      // ─── 사용자 관리: 추가/수정 (admin 전용) ───
+      // nickname + 탈퇴여부(isDeleted)를 입력받아 upsert
+      else if (data.type === 'user_upsert') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        if (senderNickname !== 'admin') {
+          ws.send(JSON.stringify({ type: 'system', text: '사용자 관리는 admin만 할 수 있습니다.' }));
+          return;
+        }
+        const nickname = String(data.nickname || '').trim().slice(0, 20);
+        if (!nickname) {
+          ws.send(JSON.stringify({ type: 'user_upsert_result', ok: false, reason: 'empty', text: '닉네임을 입력하세요.' }));
+          return;
+        }
+        const isDeleted = data.isDeleted === true || data.is_deleted === 1 || data.isDeleted === 1;
+        upsertUser(nickname, Date.now(), isDeleted);
+        console.log(`사용자 upsert by admin: ${nickname} (탈퇴=${isDeleted ? 'Y' : 'N'})`);
+        ws.send(JSON.stringify({ type: 'user_upsert_result', ok: true, nickname, isDeleted }));
+        broadcastUserList();
       }
       
       // DM 메시지 처리: 1:1 메시지 전송 (오프라인 포함 — DB 저장 후 접속 시 history로 수신)
