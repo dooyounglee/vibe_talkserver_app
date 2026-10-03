@@ -3,7 +3,6 @@ const WebSocket = require('ws');
 
 // SQLite 데이터베이스 (메시지/방 저장/조회)
 const {
-  db,
   saveMessage,
   createRoom,
   getRoom,
@@ -19,6 +18,7 @@ const {
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
+  getRecentRoomMessages,
   upsertUser,
   withdrawUser,
   isWithdrawn,
@@ -27,8 +27,9 @@ const {
   getAllUsersDetail,
 } = require('./db');
 
-// 포트 8080에서 서버 실행
-const wss = new WebSocket.Server({ port: 8080 });
+// 포트 8080에서 서버 실행 (테스트 시 PORT로 재지정 가능)
+const PORT = Number(process.env.PORT) || 8080;
+const wss = new WebSocket.Server({ port: PORT });
 
 // 클라이언트별 닉네임 저장 (WebSocket 인스턴스 -> 닉네임)
 const clients = new Map();
@@ -98,39 +99,7 @@ function broadcastUserList() {
 // 그룹 채팅 기록 조회 — 전체채팅 제거로 더 이상 사용하지 않음 (기존 DB 행은 보존)
 // function getRecentGroupHistory() — deleted
 
-// 특정 닉네임과 관련된 DM 기록을 상대방별로 그룹화해 반환
-// 각 상대방마다 최근 limit개를 시간순 오름차순으로 정리
-function getRecentDmHistories(nickname, limit = 50) {
-  const rows = db.prepare(
-    `SELECT sender, receiver, text, timestamp FROM messages
-     WHERE room_type = 'dm' AND (sender = ? OR receiver = ?)
-     ORDER BY timestamp ASC, id ASC`
-  ).all(nickname, nickname);
-
-  // 상대방 닉네임별로 메시지 그룹화
-  const byUser = new Map();
-  for (const row of rows) {
-    const counterpart = row.sender === nickname ? row.receiver : row.sender;
-    if (!byUser.has(counterpart)) {
-      byUser.set(counterpart, []);
-    }
-    byUser.get(counterpart).push({
-      nickname: row.sender,
-      text: row.text,
-      timestamp: row.timestamp
-    });
-  }
-
-  // 상대방별 최근 limit개만 추출
-  const histories = [];
-  for (const [withUser, messages] of byUser.entries()) {
-    histories.push({
-      withUser: withUser,
-      messages: messages.slice(-limit)
-    });
-  }
-  return histories;
-}
+// 접속 시 DM 기록 일괄 전송도 제거 — 채팅창 열람 시 dm_history 요청으로 대체
 
 // 새로운 클라이언트 연결 시
 wss.on('connection', (ws) => {
@@ -175,23 +144,8 @@ wss.on('connection', (ws) => {
         // 내 방 목록 전송 (삭제/폐쇄 제외)
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
 
-        // 내 방별 대화 기록 전송 (방금 접속한 클라이언트에게만)
-        for (const r of myRooms) {
-          ws.send(JSON.stringify({
-            type: 'history_room',
-            roomId: r.roomId,
-            messages: getRoomHistory(r.roomId, 50)
-          }));
-        }
-
-        // 이 닉네임과 관련된 DM 기록을 상대방별로 전송 (방금 접속한 클라이언트에게만)
-        for (const history of getRecentDmHistories(nickname, 50)) {
-          ws.send(JSON.stringify({
-            type: 'history_dm',
-            withUser: history.withUser,
-            messages: history.messages
-          }));
-        }
+        // NOTE: 접속 시 전체 방/DM 히스토리 일괄 푸시 제거.
+        // 채팅창이 열릴 때마다(room_history / dm_history 요청) DB에서 최근 10건을 조회해 준다.
 
         // admin 접속 시 관리용 전체 목록(탈퇴 포함)도 전송
         if (nickname === 'admin') {
@@ -220,7 +174,7 @@ wss.on('connection', (ws) => {
         broadcastUserList();
       }
       
-      // DM 메시지 처리: 1:1 메시지 전송 (오프라인 포함 — DB 저장 후 접속 시 history로 수신)
+      // DM 메시지 처리: 1:1 메시지 전송 (오프라인 포함 — DB 저장 후 채팅창 열람 시 history로 수신)
       else if (data.type === 'dm') {
         const senderNickname = clients.get(ws);
         if (!senderNickname) return;
@@ -309,7 +263,7 @@ wss.on('connection', (ws) => {
           // 자동방 목록/히스토리도 조용히 갱신 (방 창 자동팝업 없음)
           if (dmRoomId) {
             try {
-              const peerHistory = getRoomHistory(dmRoomId, 50);
+              const peerHistory = getRecentRoomMessages(dmRoomId, 10);
               const peerMembers = getRoomMembers(dmRoomId);
               targetClient.send(JSON.stringify({
                 type: 'my_rooms', rooms: getMyRooms(targetNickname),
@@ -341,7 +295,7 @@ wss.on('connection', (ws) => {
         // 오프라인 수신자는 다음 join 때 getMyRooms()+history_room으로 자동 복원됨
         if (dmRoomId) {
           try {
-            const selfHistory = getRoomHistory(dmRoomId, 50);
+            const selfHistory = getRecentRoomMessages(dmRoomId, 10);
             const selfMembers = getRoomMembers(dmRoomId);
             ws.send(JSON.stringify({
               type: 'my_rooms', rooms: getMyRooms(senderNickname),
@@ -357,11 +311,11 @@ wss.on('connection', (ws) => {
           }
         }
 
-        // 대상이 오프라인이면 안내 (다음 접속 시 history_dm으로 수신됨)
+        // 대상이 오프라인이면 안내 (상대가 채팅창을 열 때 history_dm으로 수신됨)
         if (!targetClient) {
           ws.send(JSON.stringify({
             type: "system",
-            text: `${targetNickname}님은 오프라인입니다. 메시지는 저장되어 다음 접속 시 전달됩니다`
+            text: `${targetNickname}님은 오프라인입니다. 메시지는 저장되어 채팅창을 열 때 확인할 수 있습니다`
           }));
         }
       }
@@ -371,6 +325,48 @@ wss.on('connection', (ws) => {
       else if (data.type === 'message') {
         return;
       }
+
+      // ─── 채팅창 열람: 1:1 최근 10건 조회 (창이 열릴 때마다 요청) ───
+      else if (data.type === 'dm_history') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        const withUser = String(data.withUser || '').trim();
+        if (!withUser) return;
+        // 1:1방이 있으면 그 방의 히스토리로 응답 (방 창에서 보낸 메시지 포함).
+        // 방이 없으면 빈 배열 → 클라이언트는 "아직 대화가 없습니다"를 표시한다.
+        let messages = [];
+        try {
+          const oneToOneRoomId = findActiveOneToOneRoom(senderNickname, withUser);
+          if (oneToOneRoomId) messages = getRecentRoomMessages(oneToOneRoomId, 10);
+        } catch (e) {
+          console.error('1:1 방 히스토리 조회 실패:', e);
+        }
+        ws.send(JSON.stringify({
+          type: 'history_dm',
+          withUser,
+          messages,
+        }));
+      }
+
+      // ─── 채팅창 열람: 번호방 최근 10건 조회 (창이 열릴 때마다 요청) ───
+      else if (data.type === 'room_history') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        const roomId = Number(data.roomId);
+        if (!Number.isInteger(roomId)) return;
+        const room = getRoom(roomId);
+        // 존재하지 않는 방/멤버가 아닌 방은 빈 히스토리로 응답 (누출 방지)
+        if (!room || !isMember(roomId, senderNickname)) {
+          ws.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
+          return;
+        }
+        ws.send(JSON.stringify({
+          type: 'history_room',
+          roomId,
+          messages: getRecentRoomMessages(roomId, 10),
+        }));
+      }
+
       // ─── 번호방: 생성 (초대 멤버 포함 가능) ───
       else if (data.type === 'room_create') {
         const senderNickname = clients.get(ws);
@@ -445,7 +441,7 @@ wss.on('connection', (ws) => {
         }
         trackJoin(ws, roomId);
         ws.send(JSON.stringify({
-          type: 'history_room', roomId, messages: getRoomHistory(roomId, 50),
+          type: 'history_room', roomId, messages: getRecentRoomMessages(roomId, 10),
         }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
         broadcastToRoom(roomId, {

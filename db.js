@@ -3,7 +3,8 @@ const path = require('path');
 const Database = require('better-sqlite3');
 
 // 프로젝트 루트의 chat.db 파일 사용 (없으면 자동 생성)
-const db = new Database(path.join(__dirname, 'chat.db'));
+// NOTE: 테스트/스모크 실행 시 VIBE_TEST_DB로 임시 DB를 지정해 실제 DB와 격리한다.
+const db = new Database(process.env.VIBE_TEST_DB || path.join(__dirname, 'chat.db'));
 
 // messages 테이블 생성 (없으면 자동 생성)
 db.exec(`
@@ -352,6 +353,44 @@ function getRoomHistory(roomId, limit = 50) {
   }));
 }
 
+// 채팅창 열람용: 방 최근 N건 (기본 10건, 오래된 → 최신 순)
+function getRecentRoomMessages(roomId, limit = 10) {
+  const rows = db
+    .prepare(
+      `SELECT sender, text, timestamp FROM messages
+       WHERE room_type = 'room' AND room_id = ?
+       ORDER BY timestamp DESC, id DESC
+       LIMIT ?`
+    )
+    .all(roomId, limit);
+  return rows.reverse().map((row) => ({
+    nickname: row.sender,
+    text: row.text,
+    timestamp: row.timestamp,
+  }));
+}
+
+// 채팅창 열람용: 두 사람 사이 1:1 최근 N건 (기본 10건, 오래된 → 최신 순)
+function getRecentDmMessages(nickname, withUser, limit = 10) {
+  const me = String(nickname || '').trim();
+  const peer = String(withUser || '').trim();
+  if (!me || !peer || me === peer) return [];
+  const rows = db
+    .prepare(
+      `SELECT sender, text, timestamp FROM messages
+       WHERE room_type = 'dm'
+         AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
+       ORDER BY timestamp DESC, id DESC
+       LIMIT ?`
+    )
+    .all(me, peer, peer, me, limit);
+  return rows.reverse().map((row) => ({
+    nickname: row.sender,
+    text: row.text,
+    timestamp: row.timestamp,
+  }));
+}
+
 // ─── 등록 사용자 (users) ───
 // admin이 직접 추가/수정. 목록은 탈퇴(is_deleted=1) 제외.
 function upsertUser(nickname, timestamp, isDeleted = false) {
@@ -437,6 +476,8 @@ module.exports = {
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
+  getRecentRoomMessages,
+  getRecentDmMessages,
   upsertUser,
   withdrawUser,
   isWithdrawn,
