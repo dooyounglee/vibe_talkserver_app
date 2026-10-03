@@ -188,6 +188,33 @@ function isMember(roomId, nickname) {
   return !!row;
 }
 
+// ─── 1:1 자동방: 활성(삭제/폐쇄 제외) + 멤버 정확히 2명(a,b)인 방 조회 ───
+// DM 첫 전송 시점에 find-or-create 용. 그룹방(3명+)은 절대 매칭되지 않음.
+function findActiveOneToOneRoom(nickA, nickB) {
+  const a = String(nickA || '').trim();
+  const b = String(nickB || '').trim();
+  if (!a || !b || a === b) return null;
+  try {
+    const row = db
+      .prepare(
+        `SELECT m.room_id AS roomId
+         FROM room_members m
+         INNER JOIN rooms r ON r.room_id = m.room_id
+         WHERE r.is_deleted = 0 AND r.is_closed = 0
+           AND m.nickname IN (?, ?)
+         GROUP BY m.room_id
+         HAVING COUNT(*) = 2
+            AND (SELECT COUNT(*) FROM room_members m2 WHERE m2.room_id = m.room_id) = 2
+         ORDER BY m.room_id ASC
+         LIMIT 1`
+      )
+      .get(a, b);
+    return row ? Number(row.roomId) : null;
+  } catch {
+    return null;
+  }
+}
+
 function addMember(roomId, nickname, timestamp) {
   db.prepare(
     `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at, display_name) VALUES (?, ?, ?, NULL)`
@@ -397,6 +424,7 @@ module.exports = {
   getRoom,
   isRoomActive,
   isMember,
+  findActiveOneToOneRoom,
   addMember,
   removeMember,
   countMembers,

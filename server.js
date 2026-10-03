@@ -9,6 +9,7 @@ const {
   getRoom,
   isRoomActive,
   isMember,
+  findActiveOneToOneRoom,
   addMember,
   removeMember,
   getRoomMembers,
@@ -263,6 +264,38 @@ wss.on('connection', (ws) => {
           }
         }
 
+        // ─── 1:1 자동방: DM 저장 직후 활성 1:1방(멤버 정확히 2명)을 확보 ───
+        // 없으면 자동 생성해 양쪽 my_rooms에 띄운다. 단체방(방 만들기)은 별도 유지.
+        // 방 history에도 이 메시지를 심어 방을 열면 대화가 이어지도록 한다.
+        // (DM창 자동팝업은 그대로, room_message를 쏘지 않으므로 방 창 자동팝업 없음)
+        let dmRoomId = null;
+        try {
+          // Node 이벤트루프 동기 구간에서 check→insert를 연속 수행해
+          // 양쪽 동시 첫메시지에 의한 중복방 생성을 1차 방지한다.
+          dmRoomId = findActiveOneToOneRoom(senderNickname, targetNickname);
+          if (!dmRoomId) {
+            dmRoomId = createRoom({
+              name: `1:1 ${senderNickname},${targetNickname}`,
+              owner: senderNickname,
+              timestamp: now,
+              members: [targetNickname],
+            });
+          }
+          if (dmRoomId) {
+            saveMessage({
+              roomType: 'room',
+              sender: senderNickname,
+              receiver: null,
+              text: text.slice(0, 2000),
+              timestamp: now,
+              roomId: dmRoomId,
+            });
+          }
+        } catch (e) {
+          console.error('1:1 자동방 생성 실패:', e);
+          dmRoomId = null;
+        }
+
         // 대상이 온라인이면 실시간 전송
         if (targetClient && targetClient.readyState === WebSocket.OPEN) {
           targetClient.send(JSON.stringify({
@@ -270,8 +303,27 @@ wss.on('connection', (ws) => {
             from: senderNickname,
             to: targetNickname,
             text: text.slice(0, 2000),
-            timestamp: now
+            timestamp: now,
+            dmRoomId,
           }));
+          // 자동방 목록/히스토리도 조용히 갱신 (방 창 자동팝업 없음)
+          if (dmRoomId) {
+            try {
+              const peerHistory = getRoomHistory(dmRoomId, 50);
+              const peerMembers = getRoomMembers(dmRoomId);
+              targetClient.send(JSON.stringify({
+                type: 'my_rooms', rooms: getMyRooms(targetNickname),
+              }));
+              targetClient.send(JSON.stringify({
+                type: 'history_room', roomId: dmRoomId, messages: peerHistory,
+              }));
+              targetClient.send(JSON.stringify({
+                type: 'room_members', roomId: dmRoomId, members: peerMembers,
+              }));
+            } catch (e) {
+              console.error('1:1 자동방 목록 반영 실패(수신자):', e);
+            }
+          }
         }
 
         // 보낸 사람에게도 에코 (내 창에 표시용)
@@ -280,8 +332,30 @@ wss.on('connection', (ws) => {
           from: senderNickname,
           to: targetNickname,
           text: text.slice(0, 2000),
-          timestamp: now
+          timestamp: now,
+          dmRoomId,
         }));
+
+        // 자동방이 확보됐으면 발신자 방 목록/히스토리도 조용히 갱신
+        // (room_message를 쏘지 않으므로 방 창 자동팝업 없음 — DM창 팝업만 유지)
+        // 오프라인 수신자는 다음 join 때 getMyRooms()+history_room으로 자동 복원됨
+        if (dmRoomId) {
+          try {
+            const selfHistory = getRoomHistory(dmRoomId, 50);
+            const selfMembers = getRoomMembers(dmRoomId);
+            ws.send(JSON.stringify({
+              type: 'my_rooms', rooms: getMyRooms(senderNickname),
+            }));
+            ws.send(JSON.stringify({
+              type: 'history_room', roomId: dmRoomId, messages: selfHistory,
+            }));
+            ws.send(JSON.stringify({
+              type: 'room_members', roomId: dmRoomId, members: selfMembers,
+            }));
+          } catch (e) {
+            console.error('1:1 자동방 목록 반영 실패(발신자):', e);
+          }
+        }
 
         // 대상이 오프라인이면 안내 (다음 접속 시 history_dm으로 수신됨)
         if (!targetClient) {
