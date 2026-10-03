@@ -37,6 +37,7 @@ db.exec(`
     room_id INTEGER NOT NULL,
     nickname TEXT NOT NULL,
     joined_at INTEGER NOT NULL,
+    display_name TEXT NULL,
     UNIQUE(room_id, nickname)
   )
 `);
@@ -74,6 +75,48 @@ try {
   console.error('messages.room_id 마이그레이션 실패:', e);
 }
 
+// ─── 사용자별 방 제목 (room_members.display_name) ───
+// 1:1방은 각자 상대방 닉네임이 보이도록 per-user 저장.
+// 그룹방은 NULL → rooms.name 폴백. 추후 "각자 제목 수정" API용 컬럼.
+try {
+  const mcols = db.prepare(`PRAGMA table_info(room_members)`).all();
+  const hasDisplayName = mcols.some((c) => c.name === 'display_name');
+  if (!hasDisplayName) {
+    db.exec(`ALTER TABLE room_members ADD COLUMN display_name TEXT NULL`);
+  }
+} catch (e) {
+  console.error('room_members.display_name 마이그레이션 실패:', e);
+}
+
+// 기존 1:1방 백필: 멤버 2명 + display_name NULL인 행만 상대 닉네임으로 채움
+try {
+  const targets = db.prepare(`
+    SELECT m.room_id AS roomId, m.nickname AS nickname
+    FROM room_members m
+    INNER JOIN rooms r ON r.room_id = m.room_id
+    WHERE r.is_deleted = 0 AND r.is_closed = 0
+      AND m.display_name IS NULL
+      AND (SELECT COUNT(*) FROM room_members m2 WHERE m2.room_id = m.room_id) = 2
+  `).all();
+  const otherStmt = db.prepare(
+    `SELECT nickname FROM room_members WHERE room_id = ? AND nickname != ? LIMIT 1`
+  );
+  const fillStmt = db.prepare(
+    `UPDATE room_members SET display_name = ? WHERE room_id = ? AND nickname = ? AND display_name IS NULL`
+  );
+  for (const t of targets) {
+    try {
+      const other = otherStmt.get(t.roomId, t.nickname);
+      if (other && other.nickname) {
+        fillStmt.run(other.nickname, t.roomId, t.nickname);
+      }
+    } catch { /* 행별 실패 무시 */ }
+  }
+  if (targets.length > 0) console.log(`1:1방 제목 백필: ${targets.length}행`);
+} catch (e) {
+  console.error('1:1방 제목 백필 실패:', e);
+}
+
 try {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, timestamp, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_room_members_nick ON room_members(nickname, room_id)`);
@@ -100,19 +143,28 @@ function createRoom({ name, owner, timestamp, members = [] }) {
     .prepare(`INSERT INTO rooms (name, owner, created_at) VALUES (?, ?, ?)`)
     .run(name, owner, timestamp);
   const roomId = Number(info.lastInsertRowid);
-  db.prepare(`INSERT INTO room_members (room_id, nickname, joined_at) VALUES (?, ?, ?)`)
-    .run(roomId, owner, timestamp);
   // 초대 멤버를 함께 등록 (중복/방장 제외, 빈 문자열 제외)
   const seen = new Set([owner]);
-  let seq = 1;
+  const invited = [];
   for (const raw of Array.isArray(members) ? members : []) {
     const nick = String(raw || '').trim();
     if (!nick || seen.has(nick)) continue;
     seen.add(nick);
+    invited.push(nick);
+  }
+  // 1:1 판정: owner + 초대 1명 = 총 2명일 때만 상대 닉네임을 display_name으로 저장
+  const isOneToOne = invited.length === 1;
+  const ownerDisplay = isOneToOne ? invited[0] : null;
+  db.prepare(`INSERT INTO room_members (room_id, nickname, joined_at, display_name) VALUES (?, ?, ?, ?)`)
+    .run(roomId, owner, timestamp, ownerDisplay);
+  let seq = 1;
+  for (const nick of invited) {
     try {
+      // 초대받은 멤버에게 보이는 제목 = 방장(상대) 닉네임 (1:1일 때만)
+      const memberDisplay = isOneToOne ? owner : null;
       db.prepare(
-        `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at) VALUES (?, ?, ?)`
-      ).run(roomId, nick, timestamp + seq);
+        `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at, display_name) VALUES (?, ?, ?, ?)`
+      ).run(roomId, nick, timestamp + seq, memberDisplay);
       seq += 1;
     } catch {
       // 무시 (개별 멤버 추가 실패가 방 생성을 막지 않음)
@@ -138,8 +190,36 @@ function isMember(roomId, nickname) {
 
 function addMember(roomId, nickname, timestamp) {
   db.prepare(
-    `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at) VALUES (?, ?, ?)`
+    `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at, display_name) VALUES (?, ?, ?, NULL)`
   ).run(roomId, nickname, timestamp);
+}
+
+// 사용자별 방 제목 조회 (없으면 NULL → 호출자가 rooms.name 폴백)
+// 추후 "각자 제목 수정" API에서 사용
+function getRoomDisplayName(roomId, nickname) {
+  try {
+    const row = db
+      .prepare(`SELECT display_name FROM room_members WHERE room_id = ? AND nickname = ?`)
+      .get(roomId, nickname);
+    return row && row.display_name ? String(row.display_name) : null;
+  } catch {
+    return null;
+  }
+}
+
+// 사용자별 방 제목 저장 (본인 행만 수정, 30자 제한)
+// 추후 "각자 제목 수정" API에서 사용
+function setRoomDisplayName(roomId, nickname, displayName) {
+  const name = String(displayName || '').trim().slice(0, 30);
+  if (!name) return false;
+  try {
+    const info = db
+      .prepare(`UPDATE room_members SET display_name = ? WHERE room_id = ? AND nickname = ?`)
+      .run(name, roomId, nickname);
+    return Number(info.changes) > 0;
+  } catch {
+    return false;
+  }
 }
 
 function removeMember(roomId, nickname) {
@@ -178,18 +258,37 @@ function transferOwner(roomId, newOwner) {
   db.prepare(`UPDATE rooms SET owner = ? WHERE room_id = ?`).run(newOwner, roomId);
 }
 
-// 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수
+// 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수 + 사용자별 표시제목
+// displayName: room_members.display_name (1:1=상대닉네임/개별수정), NULL이면 rooms.name 폴백
 function getMyRooms(nickname) {
-  return db
+  let hasDisplayCol = true;
+  try {
+    const mcols = db.prepare(`PRAGMA table_info(room_members)`).all();
+    hasDisplayCol = mcols.some((c) => c.name === 'display_name');
+  } catch {
+    hasDisplayCol = false;
+  }
+  const displayExpr = hasDisplayCol
+    ? `COALESCE(m_self.display_name, r.name)`
+    : `r.name`;
+  const rows = db
     .prepare(
-      `SELECT r.room_id AS roomId, r.name, r.owner,
+      `SELECT r.room_id AS roomId, r.name, r.owner, ${displayExpr} AS displayName,
               (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.room_id) AS memberCount
        FROM rooms r
-       INNER JOIN room_members m ON m.room_id = r.room_id AND m.nickname = ?
+       INNER JOIN room_members m_self ON m_self.room_id = r.room_id AND m_self.nickname = ?
        WHERE r.is_deleted = 0 AND r.is_closed = 0
        ORDER BY r.room_id ASC`
     )
     .all(nickname);
+  // displayName이 NULL/빈문자면 name으로 폴백 (구버전/비정상 행 안전장치)
+  return rows.map((r) => ({
+    roomId: r.roomId,
+    name: r.name,
+    owner: r.owner,
+    memberCount: r.memberCount,
+    displayName: r.displayName && String(r.displayName).trim() !== '' ? String(r.displayName) : r.name,
+  }));
 }
 
 function softDeleteRoom(roomId, deletedBy, timestamp) {
@@ -305,6 +404,8 @@ module.exports = {
   getEarliestMemberExcept,
   transferOwner,
   getMyRooms,
+  getRoomDisplayName,
+  setRoomDisplayName,
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
