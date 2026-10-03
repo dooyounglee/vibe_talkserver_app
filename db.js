@@ -286,8 +286,22 @@ function transferOwner(roomId, newOwner) {
   db.prepare(`UPDATE rooms SET owner = ? WHERE room_id = ?`).run(newOwner, roomId);
 }
 
-// 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수 + 사용자별 표시제목
+// 마지막 메시지 요약: 방별 가장 최근 1건 (내용/시간/발신자)
+// row_number로 방마다 1행만 뽑아 LEFT JOIN 한다 (메시지 없는 방은 NULL)
+// 정렬 기준은 timestamp DESC, id DESC — 히스토리 조회와 동일한 "최신" 판정
+const lastMessageJoin = `
+    LEFT JOIN (
+      SELECT room_id, text, timestamp, sender FROM (
+        SELECT room_id, text, timestamp, sender,
+               ROW_NUMBER() OVER (PARTITION BY room_id ORDER BY timestamp DESC, id DESC) AS rn
+        FROM messages
+        WHERE room_type = 'room' AND room_id IS NOT NULL
+      ) WHERE rn = 1
+    ) last_msg ON last_msg.room_id = r.room_id`;
+
+// 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수 + 사용자별 표시제목 + 마지막 메시지
 // displayName: room_members.display_name (1:1=상대닉네임/개별수정), NULL이면 rooms.name 폴백
+// lastMessage/lastMessageAt/lastMessageSender: 마지막 메시지 요약 (없으면 null)
 function getMyRooms(nickname) {
   let hasDisplayCol = true;
   try {
@@ -302,9 +316,13 @@ function getMyRooms(nickname) {
   const rows = db
     .prepare(
       `SELECT r.room_id AS roomId, r.name, r.owner, ${displayExpr} AS displayName,
-              (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.room_id) AS memberCount
+              (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.room_id) AS memberCount,
+              last_msg.text AS lastMessage,
+              last_msg.timestamp AS lastMessageAt,
+              last_msg.sender AS lastMessageSender
        FROM rooms r
        INNER JOIN room_members m_self ON m_self.room_id = r.room_id AND m_self.nickname = ?
+       ${lastMessageJoin}
        WHERE r.is_deleted = 0 AND r.is_closed = 0
        ORDER BY r.room_id ASC`
     )
@@ -316,6 +334,9 @@ function getMyRooms(nickname) {
     owner: r.owner,
     memberCount: r.memberCount,
     displayName: r.displayName && String(r.displayName).trim() !== '' ? String(r.displayName) : r.name,
+    lastMessage: r.lastMessage == null ? null : String(r.lastMessage),
+    lastMessageAt: r.lastMessageAt == null ? null : Number(r.lastMessageAt),
+    lastMessageSender: r.lastMessageSender == null ? null : String(r.lastMessageSender),
   }));
 }
 

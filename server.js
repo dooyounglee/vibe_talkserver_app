@@ -527,6 +527,11 @@ wss.on('connection', (ws) => {
           roomType: 'room', sender: senderNickname, receiver: null,
           text: payload.text, timestamp, roomId,
         });
+        // '내 채팅방' 목록의 마지막 메시지/시간 실시간 갱신용 (DB 재조회 없이 가볍게 반영)
+        broadcastToRoom(roomId, {
+          type: 'room_last_message', roomId,
+          from: senderNickname, text: payload.text, timestamp,
+        });
       }
 
       // ─── 번호방: 내 목록 새로고침 ───
