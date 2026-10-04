@@ -172,6 +172,145 @@ function clearUnreadForRoom(nickname, roomId, timestamp) {
   clearUnread(nickname, 'room', String(roomId), timestamp);
 }
 
+// ─── 읽음 커서 (카톡식 메시지별 '안 읽은 사람 수' 표시의 단일 진실) ───
+// 기존 unread 테이블은 "내가 안 읽은 받은 메시지 수"를 세는 목록 배지용이고,
+// 여기는 "상대가 내 메시지를 읽었는지"를 추적한다. 두 기능은 목적이 달라 따로 둔다.
+//
+// 메시지마다 읽음 여부 행을 만들지 않고, 각 사용자가 "이 대화에서 어디까지 읽었는지"
+// 커서 하나만 저장한다. messages.id 는 단조 증가하므로
+//   커서 < 메시지id  →  그 사용자는 아직 그 메시지를 안 읽었다
+// 로 판정할 수 있다. (메시지별 플래그보다 행 수가 훨씬 적다)
+// 화면 메모리로는 로그아웃/다른 PC 접속 시 숫자가 사라지므로 DB에 영속화한다.
+//   nickname : 읽은 사람
+//   scope    : 'dm' | 'room'
+//   target   : dm이면 상대 닉네임, room이면 방번호(문자열)
+//              (unread 테이블과 동일 규약 → DM창/1:1방창을 하나의 대화로 처리 가능)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS read_cursor (
+    nickname TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target TEXT NOT NULL,
+    last_read_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (nickname, scope, target)
+  )
+`);
+
+const upsertReadCursorStmt = db.prepare(
+  `INSERT INTO read_cursor (nickname, scope, target, last_read_id, updated_at) VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(nickname, scope, target) DO UPDATE SET last_read_id = excluded.last_read_id, updated_at = excluded.updated_at`
+);
+const getReadCursorsStmt = db.prepare(
+  `SELECT nickname, last_read_id FROM read_cursor WHERE scope = ? AND target = ?`
+);
+const deleteReadCursorStmt = db.prepare(
+  `DELETE FROM read_cursor WHERE nickname = ? AND scope = ? AND target = ?`
+);
+
+/** 읽음 커서 전진 (뒤로 가지 않도록 max 로 감산 — 과거 메시지 요청이 뒤로 밀어내지 않게) */
+function markRead(nickname, scope, target, lastReadId, timestamp) {
+  if (!nickname || !scope || !target) return;
+  try {
+    upsertReadCursorStmt.run(
+      String(nickname),
+      String(scope),
+      String(target),
+      Math.max(0, Math.floor(Number(lastReadId) || 0)),
+      timestamp,
+    );
+  } catch (e) {
+    console.error('읽음 커서 갱신 실패:', e);
+  }
+}
+
+/** 해당 대화의 모든 참여자 읽음 커서 → { 닉네임: lastReadId } */
+function getReadCursors(scope, target) {
+  const out = {};
+  if (!scope || !target) return out;
+  try {
+    for (const row of getReadCursorsStmt.all(String(scope), String(target))) {
+      out[String(row.nickname)] = Number(row.last_read_id) || 0;
+    }
+  } catch (e) {
+    console.error('읽음 커서 조회 실패:', e);
+  }
+  return out;
+}
+
+/** 특정 사용자의 읽음 커서 삭제 (방 탈퇴 시 — 재입장하면 최신 위치로 다시 잡는다) */
+function clearReadCursor(nickname, scope, target) {
+  if (!nickname || !scope || !target) return;
+  try {
+    deleteReadCursorStmt.run(String(nickname), String(scope), String(target));
+  } catch (e) {
+    console.error('읽음 커서 삭제 실패:', e);
+  }
+}
+
+// 방에서 읽음 처리 시 "여기까지 읽었다" 기준이 되는 최신 메시지 id
+function getLatestRoomMessageId(roomId) {
+  try {
+    const row = db
+      .prepare(`SELECT MAX(id) AS id FROM messages WHERE room_type = 'room' AND room_id = ?`)
+      .get(roomId);
+    return row && row.id ? Number(row.id) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// 1:1에서 읽음 처리 시 기준이 되는 최신 메시지 id (dm 행 기준)
+function getLatestDmMessageId(nickname, withUser) {
+  const me = String(nickname || '').trim();
+  const peer = String(withUser || '').trim();
+  if (!me || !peer || me === peer) return 0;
+  try {
+    const row = db
+      .prepare(
+        `SELECT MAX(id) AS id FROM messages
+         WHERE room_type = 'dm'
+           AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))`
+      )
+      .get(me, peer, peer, me);
+    return row && row.id ? Number(row.id) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 한 메시지를 아직 안 읽은 사람 수 (카톡의 '1' / '4' 숫자).
+ * 발신자 자신은 세지 않고, participants(현재 대화 참여자) 중
+ * 커서가 메시지 id 보다 작은 사람만 센다.
+ */
+function countUnreadForMessage(cursors, participants, senderNickname, messageId) {
+  const sender = String(senderNickname || '').trim();
+  const id = Number(messageId) || 0;
+  if (!id) return 0;
+  let count = 0;
+  for (const raw of Array.isArray(participants) ? participants : []) {
+    const nick = String(raw || '').trim();
+    if (!nick || nick === sender) continue;
+    const readId = Number(cursors[nick]) || 0;
+    if (readId < id) count += 1;
+  }
+  return count;
+}
+
+/**
+ * 메시지 배열에 안 읽은 사람 수(unreadCount)를 붙여 돌려준다.
+ * messages 항목은 { id, nickname, text, timestamp } 형태여야 한다.
+ */
+function decorateUnreadCounts(scope, target, messages, participants) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length === 0) return list;
+  const cursors = getReadCursors(scope, target);
+  return list.map((m) => ({
+    ...m,
+    unreadCount: countUnreadForMessage(cursors, participants, m.nickname, m.id),
+  }));
+}
+
 // 기존 DB 마이그레이션: messages.room_id 컬럼 추가 (이미 있으면 무시)
 try {
   const cols = db.prepare(`PRAGMA table_info(messages)`).all();
@@ -485,16 +624,18 @@ function closeRoomIfEmpty(roomId, timestamp) {
 }
 
 // 방 대화 기록 (오래된 → 최신 순)
+// NOTE: 읽음 표시(unreadCount) 계산을 위해 messages.id 도 함께 돌려준다.
 function getRoomHistory(roomId, limit = 50) {
   const rows = db
     .prepare(
-      `SELECT sender, text, timestamp FROM messages
+      `SELECT id, sender, text, timestamp FROM messages
        WHERE room_type = 'room' AND room_id = ?
        ORDER BY timestamp DESC, id DESC
        LIMIT ?`
     )
     .all(roomId, limit);
   return rows.reverse().map((row) => ({
+    id: Number(row.id),
     nickname: row.sender,
     text: row.text,
     timestamp: row.timestamp,
@@ -505,13 +646,14 @@ function getRoomHistory(roomId, limit = 50) {
 function getRecentRoomMessages(roomId, limit = 10) {
   const rows = db
     .prepare(
-      `SELECT sender, text, timestamp FROM messages
+      `SELECT id, sender, text, timestamp FROM messages
        WHERE room_type = 'room' AND room_id = ?
        ORDER BY timestamp DESC, id DESC
        LIMIT ?`
     )
     .all(roomId, limit);
   return rows.reverse().map((row) => ({
+    id: Number(row.id),
     nickname: row.sender,
     text: row.text,
     timestamp: row.timestamp,
@@ -525,7 +667,7 @@ function getRecentDmMessages(nickname, withUser, limit = 10) {
   if (!me || !peer || me === peer) return [];
   const rows = db
     .prepare(
-      `SELECT sender, text, timestamp FROM messages
+      `SELECT id, sender, text, timestamp FROM messages
        WHERE room_type = 'dm'
          AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
        ORDER BY timestamp DESC, id DESC
@@ -533,6 +675,7 @@ function getRecentDmMessages(nickname, withUser, limit = 10) {
     )
     .all(me, peer, peer, me, limit);
   return rows.reverse().map((row) => ({
+    id: Number(row.id),
     nickname: row.sender,
     text: row.text,
     timestamp: row.timestamp,
@@ -639,4 +782,12 @@ module.exports = {
   clearUnread,
   clearUnreadForRoom,
   getOneToOnePeer,
+  // 읽음 커서 (메시지별 '안 읽은 사람 수' 표시)
+  markRead,
+  getReadCursors,
+  clearReadCursor,
+  getLatestRoomMessageId,
+  getLatestDmMessageId,
+  countUnreadForMessage,
+  decorateUnreadCounts,
 };

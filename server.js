@@ -32,6 +32,13 @@ const {
   clearUnread,
   clearUnreadForRoom,
   getOneToOnePeer,
+  markRead,
+  getReadCursors,
+  clearReadCursor,
+  getLatestRoomMessageId,
+  getLatestDmMessageId,
+  countUnreadForMessage,
+  decorateUnreadCounts,
 } = require('./db');
 
 // 포트 8080에서 서버 실행 (테스트 시 PORT로 재지정 가능)
@@ -77,6 +84,59 @@ function broadcastToRoom(roomId, message) {
     trackJoin(client, roomId);
     client.send(payload);
   });
+}
+
+// ─── 읽음 변경 알림 (카톡의 '1' 숫자가 실시간으로 줄어드는 동작) ───
+// 누군가 대화를 읽으면 그 대화의 모든 참여자에게 알려 준다.
+// 각 클라이언트는 자신이 보낸 메시지의 숫자만 다시 계산해 갱신한다.
+function broadcastReadAck(scope, target) {
+  // 최신 커서 맵을 함께 실어 보내면 클라이언트가 재요청 없이 숫자를 갱신할 수 있다.
+  const payload = JSON.stringify({
+    type: 'read_ack',
+    scope,
+    target: String(target),
+    cursors: getReadCursors(scope, String(target)),
+  });
+  if (scope === 'room') {
+    const roomId = Number(target);
+    if (!Number.isInteger(roomId)) return;
+    wss.clients.forEach(client => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      const nick = clients.get(client);
+      if (!nick || !isMember(roomId, nick)) return;
+      client.send(payload);
+    });
+    return;
+  }
+  // dm: 두 당사자에게만 (나와 상대 모두 내 메시지의 숫자가 바뀌므로 둘 다 알린다)
+  wss.clients.forEach(client => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    if (!clients.get(client)) return;
+    client.send(payload);
+  });
+}
+
+// 1:1 대화의 읽음 커서를 갱신하고, 1:1 자동방이 있으면 그쪽 커서도 함께 갱신한다.
+// (DM창과 1:1방창은 같은 대화를 보여주므로 어느 창으로 읽어도 숫자가 같이 줄어야 한다)
+function markDmRead(nickname, peer, timestamp) {
+  markRead(nickname, 'dm', dmCursorTarget(nickname, peer), getLatestDmMessageId(nickname, peer), timestamp);
+  const oneToOneRoomId = findActiveOneToOneRoom(nickname, peer);
+  if (oneToOneRoomId) {
+    markRead(nickname, 'room', String(oneToOneRoomId), getLatestRoomMessageId(oneToOneRoomId), timestamp);
+  }
+}
+
+// ─── 1:1 읽음 커서의 대화 키 정규화 ───
+// read_cursor 는 (읽은 사람, scope, target) 을 키로 쓰므로, 1:1에서 target 을
+// "상대 닉네임"으로 두면 A→B 커서와 B→A 커서가 서로 다른 행으로 흩어져
+// "안 읽은 사람 수"를 셀 때 한쪽만 조회되게 된다.
+// 그래서 1:1은 두 닉네임을 정렬해 합친 키를 사용한다.
+//   A가 (A,B) 대화에서 읽음 → target = "A|B"
+//   B가 같은 대화에서 읽음 → target = "A|B"  (같은 행!)
+// 그러면 getReadCursors('dm', 'A|B') 한 번으로 양쪽 커서를 함께 얻는다.
+// (unread 테이블은 '내가 안 읽은 수'라 흩어져도 상관없었으므로 규약이 다르다)
+function dmCursorTarget(a, b) {
+  return [String(a || ''), String(b || '')].sort().join('|');
 }
 
 // 등록된 전체 사용자 목록 + 현재 접속중 목록을 전체 클라이언트에게 전송
@@ -211,13 +271,24 @@ wss.on('connection', (ws) => {
 
         const now = Date.now();
         // DB에 메시지 저장 (1:1 채팅, 오프라인 포함)
-        saveMessage({
+        // 저장된 행 id 를 기억해 둔다 → 발신자 화면에 붙일 '안 읽은 사람 수' 계산에 쓴다.
+        const savedDm = saveMessage({
           roomType: 'dm',
           sender: senderNickname,
           receiver: targetNickname,
           text: text.slice(0, 2000),
           timestamp: now
         });
+        const dmMsgId = Number(savedDm?.lastInsertRowid || 0);
+        // 1:1 대화 참여자 = 나 + 상대.
+        const dmParticipants = [senderNickname, targetNickname];
+        // 방금 보낸 메시지는 상대가 아직 못 읽었으므로 카톡과 같이 '1' 로 시작한다.
+        const dmUnreadCount = countUnreadForMessage(
+          getReadCursors('dm', dmCursorTarget(senderNickname, targetNickname)),
+          dmParticipants,
+          senderNickname,
+          dmMsgId,
+        );
 
         // 대상 클라이언트 찾기
         let targetClient = null;
@@ -279,6 +350,9 @@ wss.on('connection', (ws) => {
             text: text.slice(0, 2000),
             timestamp: now,
             dmRoomId,
+            // 읽음 숫자 계산용 id (수신자 화면에서는 안 쓰지만 히스토리와 동일한 형태를 유지)
+            msgId: dmMsgId,
+            unreadCount: dmUnreadCount,
           }));
           // 안읽은 배지 실시간 반영 (DB 값은 위에서 이미 증가시켜 두었다)
           targetClient.send(JSON.stringify({
@@ -311,6 +385,7 @@ wss.on('connection', (ws) => {
         }
 
         // 보낸 사람에게도 에코 (내 창에 표시용)
+        // unreadCount 를 붙이는 것이 핵심 — 내 메시지 옆에 카톡식 숫자가 뜬다.
         ws.send(JSON.stringify({
           type: "dm",
           from: senderNickname,
@@ -318,6 +393,8 @@ wss.on('connection', (ws) => {
           text: text.slice(0, 2000),
           timestamp: now,
           dmRoomId,
+          msgId: dmMsgId,
+          unreadCount: dmUnreadCount,
         }));
 
         // 자동방이 확보됐으면 발신자 방 목록/히스토리도 조용히 갱신
@@ -365,11 +442,22 @@ wss.on('connection', (ws) => {
         // 1:1방이 있으면 그 방의 히스토리로 응답 (방 창에서 보낸 메시지 포함).
         // 방이 없으면 빈 배열 → 클라이언트는 "아직 대화가 없습니다"를 표시한다.
         let messages = [];
+        let oneToOneRoomId = null;
         try {
-          const oneToOneRoomId = findActiveOneToOneRoom(senderNickname, withUser);
+          oneToOneRoomId = findActiveOneToOneRoom(senderNickname, withUser);
           if (oneToOneRoomId) messages = getRecentRoomMessages(oneToOneRoomId, 10);
         } catch (e) {
           console.error('1:1 방 히스토리 조회 실패:', e);
+        }
+        // DM창은 1:1 "방"의 메시지를 보여주므로 읽음 숫자도 그 방 스코프로 계산한다.
+        // (markDmRead 가 DM/방 커서를 함께 갱신하므로 어느 창으로 읽어도 숫자가 같이 줄어든다)
+        if (oneToOneRoomId) {
+          messages = decorateUnreadCounts(
+            'room',
+            String(oneToOneRoomId),
+            messages,
+            getRoomMembers(oneToOneRoomId),
+          );
         }
         ws.send(JSON.stringify({
           type: 'history_dm',
@@ -393,7 +481,12 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({
           type: 'history_room',
           roomId,
-          messages: getRecentRoomMessages(roomId, 10),
+          messages: decorateUnreadCounts(
+            'room',
+            String(roomId),
+            getRecentRoomMessages(roomId, 10),
+            getRoomMembers(roomId),
+          ),
         }));
       }
 
@@ -476,7 +569,13 @@ wss.on('connection', (ws) => {
         }
         trackJoin(ws, roomId);
         ws.send(JSON.stringify({
-          type: 'history_room', roomId, messages: getRecentRoomMessages(roomId, 10),
+          type: 'history_room', roomId,
+          messages: decorateUnreadCounts(
+            'room',
+            String(roomId),
+            getRecentRoomMessages(roomId, 10),
+            getRoomMembers(roomId),
+          ),
         }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
         broadcastToRoom(roomId, {
@@ -602,16 +701,27 @@ wss.on('connection', (ws) => {
         if (!isRoomActive(room)) return;
         if (!isMember(roomId, senderNickname)) return;
         const timestamp = Date.now();
+        const roomMembers = getRoomMembers(roomId);
         const payload = {
           type: 'room_message', roomId,
           from: senderNickname, text: text.slice(0, 2000), timestamp,
         };
-        broadcastToRoom(roomId, payload);
         console.log(`#${roomId} ${senderNickname}: ${text}`);
-        saveMessage({
+        const savedRoom = saveMessage({
           roomType: 'room', sender: senderNickname, receiver: null,
           text: payload.text, timestamp, roomId,
         });
+        // 저장된 행 id + 읽지 않은 멤버 수를 붙인다.
+        // 발신자 본인 화면에서 카톡식 숫자로 표시되고, 상대가 읽으면 나중에 감소한다.
+        const roomMsgId = Number(savedRoom?.lastInsertRowid || 0);
+        payload.msgId = roomMsgId;
+        payload.unreadCount = countUnreadForMessage(
+          getReadCursors('room', String(roomId)),
+          roomMembers,
+          senderNickname,
+          roomMsgId,
+        );
+        broadcastToRoom(roomId, payload);
         // '내 채팅방' 목록의 마지막 메시지/시간 실시간 갱신용 (DB 재조회 없이 가볍게 반영)
         broadcastToRoom(roomId, {
           type: 'room_last_message', roomId,
@@ -621,7 +731,7 @@ wss.on('connection', (ws) => {
         // 방 멤버(발신자 제외) 안읽은 건수 +1.
         // 온라인 멤버에게는 갱신 신호를 보내 배지가 바로 반영되게 하고,
         // 오프라인 멤버는 DB에 누적되었다가 다음 접속 시 복원된다.
-        for (const member of getRoomMembers(roomId)) {
+        for (const member of roomMembers) {
           if (member === senderNickname) continue;
           bumpUnread(member, 'room', String(roomId), timestamp);
         }
@@ -638,6 +748,7 @@ wss.on('connection', (ws) => {
       // ─── 안읽은 건수: 읽음 처리 ───
       // 채팅창을 열거나 메시지를 읽으면 클라이언트가 이 신호를 보낸다.
       // 서버 DB에서 0으로 갱신하므로 다른 PC/브라우저로 로그인해도 반영된다.
+      // 동시에 읽음 커서(read_cursor)도 전진시켜, 카톡식 메시지별 '1' 숫자를 갱신한다.
       else if (data.type === 'unread_clear') {
         const senderNickname = clients.get(ws);
         if (!senderNickname) return;
@@ -648,19 +759,31 @@ wss.on('connection', (ws) => {
           if (!Number.isInteger(roomId)) return;
           // 멤버인 경우만 읽음 처리 (권한 판정은 DB 기준)
           if (!isMember(roomId, senderNickname)) return;
-          clearUnread(senderNickname, 'room', String(roomId), Date.now());
+          const now = Date.now();
+          clearUnread(senderNickname, 'room', String(roomId), now);
+          // 읽음 커서를 이 방의 최신 메시지까지 전진 → 내 메시지 옆 숫자가 0 으로 내려간다
+          markRead(senderNickname, 'room', String(roomId), getLatestRoomMessageId(roomId), now);
+          broadcastReadAck('room', String(roomId));
           // 1:1 방을 열면 '사용자' 탭의 DM 배지도 함께 지운다 (같은 대화)
           const oneToOnePeer = getOneToOnePeer(roomId, senderNickname);
           if (oneToOnePeer) {
             clearUnread(senderNickname, 'dm', oneToOnePeer, Date.now());
+            // DM 쪽 커서도 함께 갱신 (DM창에서 본 숫자도 같이 줄게)
+            markRead(senderNickname, 'dm', dmCursorTarget(senderNickname, oneToOnePeer), getLatestDmMessageId(senderNickname, oneToOnePeer), Date.now());
+            broadcastReadAck('dm', dmCursorTarget(senderNickname, oneToOnePeer));
           }
         } else {
           // DM 읽음: '사용자' 탭 배지와, 같은 대화를 보여주는 1:1 방 배지를 함께 지운다.
           // (한쪽 탭에서만 열어도 양쪽 모두 읽음 상태가 되어야 배지가 어긋나지 않는다)
-          clearUnread(senderNickname, 'dm', target, Date.now());
+          const now = Date.now();
+          clearUnread(senderNickname, 'dm', target, now);
+          markDmRead(senderNickname, target, now);
+          broadcastReadAck('dm', dmCursorTarget(senderNickname, target));
           const oneToOneRoomId = findActiveOneToOneRoom(senderNickname, target);
           if (oneToOneRoomId) {
-            clearUnread(senderNickname, 'room', String(oneToOneRoomId), Date.now());
+            clearUnread(senderNickname, 'room', String(oneToOneRoomId), now);
+            // 1:1 방으로 표시 중인 창에도 같은 변화가 반영되어야 하므로 방 스코프도 알린다.
+            broadcastReadAck('room', String(oneToOneRoomId));
           }
         }
       }
