@@ -127,18 +127,14 @@ const fetchRoomHistory = async (client, roomId) => {
     hist = await fetchDmHistory(b, 'admin');
     assert(findUnread(hist, 'dm-2') === 1, '1:1 반대 방향도 안읽음 1 표시');
 
-    // 4. 재접속해도 유지 (DB 영속) — admin 이 아직 안 읽었으므로 root 화면의 '1' 이 살아있어야 한다.
-    //    (숫자는 '지금 보는 사람'을 제외하므로, 안읽음 유지 검증은 발신자(root) 화면으로 한다)
+    // 4. 재접속해도 유지 (DB 영속) — admin 이 아직 안 읽었으므로 '1' 이 살아있어야 한다
     a.close();
     await wait(300);
     a = await connect('admin');
     await a.ready;
     await wait(300);
-    hist = await fetchDmHistory(b, 'admin');
-    assert(findUnread(hist, 'dm-2') === 1, '재접속 후에도 안읽음 숫자 유지 (1:1)');
-    // admin 화면의 'root 의 메시지(dm-2)'는 남은 사람이 없으므로 0 (카톡과 동일)
     hist = await fetchDmHistory(a, 'root');
-    assert(findUnread(hist, 'dm-2') === 0, '1:1 수신 화면: 열람자는 집계에서 제외되어 0');
+    assert(findUnread(hist, 'dm-2') === 1, '재접속 후에도 안읽음 숫자 유지 (1:1)');
 
     // ─── 단체 읽음 표시 ───
     // 5. 3명 그룹방 생성 (admin + root + other)
@@ -210,14 +206,13 @@ const fetchRoomHistory = async (client, roomId) => {
       'room_history 에 참여자 목록(members)이 포함됨',
     );
     // 클라이언트 재계산 규칙(useChatSocket.ts countUnread)을 그대로 적용한다.
-    // 발신자와 '지금 화면을 보는 사람(viewer)'을 제외하고 세는 규칙까지 일치시켜야 한다.
     // id 를 모르면 null(=계산 불가, 기존 값 유지)을 돌려야 한다.
     // 0 을 돌리면 "한 번에 사라짐" 버그가 되므로 회귀 검증의 핵심이다.
-    const clientCount = (cursors, members, sender, msgId, viewer) => {
+    const clientCount = (cursors, members, sender, msgId) => {
       if (!msgId) return null;
       let n = 0;
       for (const nick of members || []) {
-        if (!nick || nick === sender || nick === viewer) continue;
+        if (!nick || nick === sender) continue;
         if ((cursors?.[nick] ?? 0) < msgId) n += 1;
       }
       return n;
@@ -231,7 +226,7 @@ const fetchRoomHistory = async (client, roomId) => {
         && Number(m.cursors?.other || 0) < msg3.msgId,
     );
     assert(
-      clientCount(ack2.cursors, ack2.members, 'admin', msg3.msgId, 'admin') === 1,
+      clientCount(ack2.cursors, ack2.members, 'admin', msg3.msgId) === 1,
       '실시간 감소: root 읽음 → 2 에서 1 로 하나만 감소 (한 번에 사라지지 않음)',
     );
 
@@ -242,7 +237,7 @@ const fetchRoomHistory = async (client, roomId) => {
         && Number(m.cursors?.other || 0) >= msg3.msgId,
     );
     assert(
-      clientCount(ack3.cursors, ack3.members, 'admin', msg3.msgId, 'admin') === 0,
+      clientCount(ack3.cursors, ack3.members, 'admin', msg3.msgId) === 0,
       '실시간 감소: other 까지 읽음 → 숫자 소멸',
     );
 
@@ -257,42 +252,38 @@ const fetchRoomHistory = async (client, roomId) => {
     roomHist = await fetchRoomHistory(a, roomId);
     assert(findUnread(roomHist, 'room-4') === 2, '단체: 재접속 후에도 안읽음 2 유지');
 
-    // 11. 상대 입장에서 메시지를 볼 때 '나 자신(열람자)'은 세지 않는다 (오버카운트 없음)
-    // other 화면에서 본다 → 발신자 admin 과 열람자 other 가 빠지므로 남는 사람은 root.
-    // root 는 이미 읽었으므로 0.
+    // 11. 상대 입장에서 메시지를 볼 때, blur 상태라면 '나 자신'도 집계된다
+    // other 화면에서 room-4 를 본다 → 발신자 admin 제외, root 는 읽었고 other 는 안 읽음 → 1
     markRead(b, 'room', roomId);
     await wait(400);
     roomHist = await fetchRoomHistory(c, roomId);
-    assert(findUnread(roomHist, 'room-4') === 0, '상대 입장에서 내가 읽으면 남은 미열람 0 (나 자신은 세지 않음)');
+    assert(findUnread(roomHist, 'room-4') === 1, 'blur 상태의 수신 화면: 안 읽었으므로 \'나\'도 집계 → 1');
 
-    // ─── 카톡식 시나리오: 상대 메시지(message-other)에도 숫자가 붙는다 ───
-    // admin(A) 이 보냄 → root(B) 가 읽음 → other(C) 는 아직 안 읽음
-    //   admin 화면(본인 메시지)   : 1  (C 만 남음)
-    //   root 화면(admin 의 메시지) : 1  (B 자신은 읽었으니 빼고 C 만 남음)
+    // ─── 카톡식 시나리오: 상대 메시지(message-other) 숫자가 focus 로 2 → 1 ───
+    // admin(A) 이 보냄 → root(B) 의 채팅창은 blur 상태, other(C) 도 미열람
+    //   blur : A 화면 '2', B 화면 '2' (B 자신도 아직 안 읽었으므로)
+    //   focus: B 가 확인 → unread_clear → 커서 전진 → A/B 화면 모두 '1' (C 만 남음)
     a.send({ type: 'room_message', roomId, text: 'room-5' });
     await wait(300);
-    // 라이브 room_message 도 수신자별로 숫자가 달라야 한다 (한 payload 를 공유하면 안 됨)
     const liveSelf = a.inbox.filter((m) => m.type === 'room_message' && m.text === 'room-5').pop();
     const liveRoot = b.inbox.filter((m) => m.type === 'room_message' && m.text === 'room-5').pop();
     assert(
       Number(liveSelf?.unreadCount) === 2,
-      '라이브 room_message: 발신자(admin) 화면 숫자 2 (아직 아무도 안 읽음)',
+      'blur 상태: 발신자(admin) 화면 숫자 2 (아직 아무도 안 읽음)',
     );
     assert(
-      Number(liveRoot?.unreadCount) === 1,
-      '라이브 room_message: 상대(root) 화면 숫자 1 (열람자 본인 제외)',
+      Number(liveRoot?.unreadCount) === 2,
+      'blur 상태: 상대(root) 화면 숫자 2 (열람자 자신도 미열람으로 집계)',
     );
     let rootHist = await fetchRoomHistory(b, roomId);
-    assert(findUnread(rootHist, 'room-5') === 1, '상대 메시지(message-other)에도 숫자 표시 — 열람자는 제외');
+    assert(findUnread(rootHist, 'room-5') === 2, 'blur 상태: 상대 메시지(message-other)에도 2 표시');
 
-    markRead(b, 'room', roomId); // B 확인
+    markRead(b, 'room', roomId); // B focus → 확인
     await wait(400);
     rootHist = await fetchRoomHistory(b, roomId);
-    assert(findUnread(rootHist, 'room-5') === 1, '내가 읽은 뒤에도 남은 미열람 인원(C) 숫자가 유지');
+    assert(findUnread(rootHist, 'room-5') === 1, 'focus 후: 상대 메시지 숫자가 2 → 1 로 감소');
     roomHist = await fetchRoomHistory(a, roomId);
-    assert(findUnread(roomHist, 'room-5') === 1, '발신자 화면: B가 확인 → 2 에서 1 로 감소');
-    roomHist = await fetchRoomHistory(b, roomId);
-    assert(findUnread(roomHist, 'room-5') === 1, '상대 메시지 숫자는 발신자 화면과 같은 값(1)');
+    assert(findUnread(roomHist, 'room-5') === 1, 'focus 후: 발신자 화면도 2 → 1 로 감소');
 
     // 12. 마지막으로 C 까지 읽으면 모두에게서 숫자가 사라진다
     markRead(c, 'room', roomId);
@@ -302,11 +293,15 @@ const fetchRoomHistory = async (client, roomId) => {
     rootHist = await fetchRoomHistory(b, roomId);
     assert(findUnread(rootHist, 'room-5') === 0, '전원 확인 → 상대 메시지 숫자도 소멸');
 
-    // 13. 1:1 은 받은 메시지에 숫자가 붙지 않는다 (나 + 상대 = 전원이므로 0)
+    // 13. 1:1 도 같은 규칙 — blur 면 '나'가 세어지고, 읽음 처리하면 0
     b.send({ type: 'dm', to: 'admin', text: 'dm-3' });
     await wait(300);
     hist = await fetchDmHistory(a, 'root');
-    assert(findUnread(hist, 'dm-3') === 0, '1:1 수신 화면: 받은 메시지에는 숫자 없음 (카톡과 동일)');
+    assert(findUnread(hist, 'dm-3') === 1, '1:1 blur 상태: 받은 메시지도 \'나\'가 집계되어 1');
+    markRead(a, 'dm', 'root');
+    await wait(400);
+    hist = await fetchDmHistory(a, 'root');
+    assert(findUnread(hist, 'dm-3') === 0, '1:1 읽음 처리 후 0');
 
     console.log('\nREAD RECEIPT SMOKE PASSED');
     a.close(); b.close(); c.close();
