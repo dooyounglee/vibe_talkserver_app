@@ -16,6 +16,7 @@ const {
   getEarliestMemberExcept,
   transferOwner,
   getMyRooms,
+  setRoomDisplayName,
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
@@ -482,6 +483,53 @@ wss.on('connection', (ws) => {
           type: 'room_members', roomId, members: getRoomMembers(roomId),
         });
       }
+      // ─── 번호방: 방제목 수정 (사용자별 — 고친 사람에게만 적용) ───
+      // 제목은 room_members.display_name(방×멤버 행)에 저장되므로 같은 방의 다른
+      // 멤버는 그대로 본다. 서버도 "요청한 본인 행"만 고치게 하여 1:1방/단체방 모두
+      // 별도 구분 없이 같은 방식으로 동작한다.
+      else if (data.type === 'room_rename') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        const roomId = Number(data.roomId);
+        if (!Number.isInteger(roomId)) return;
+        const title = String(data.title || '').trim();
+        if (!title) {
+          ws.send(JSON.stringify({
+            type: 'room_rename_failed', roomId, reason: 'empty_title',
+          }));
+          return;
+        }
+        const room = getRoom(roomId);
+        if (!room || room.is_deleted === 1 || room.is_closed === 1) {
+          ws.send(JSON.stringify({
+            type: 'room_rename_failed', roomId, reason: 'not_found',
+          }));
+          return;
+        }
+        // 멤버만 수정 가능 (권한 판정은 DB 기준)
+        if (!isMember(roomId, senderNickname)) {
+          ws.send(JSON.stringify({
+            type: 'room_rename_failed', roomId, reason: 'not_member',
+          }));
+          return;
+        }
+        const ok = setRoomDisplayName(roomId, senderNickname, title);
+        if (!ok) {
+          ws.send(JSON.stringify({
+            type: 'room_rename_failed', roomId, reason: 'update_failed',
+          }));
+          return;
+        }
+        console.log(`방 #${roomId} 제목 변경 by ${senderNickname} → "${title}"`);
+        // 수정한 본인에게만 새 목록을 내려준다 (다른 멤버 제목은 그대로여서 무의미).
+        // 같은 닉네임의 다른 소켓(같은 PC의 여러 탭 등)도 함께 갱신한다.
+        wss.clients.forEach((client) => {
+          if (clients.get(client) !== senderNickname) return;
+          if (client.readyState !== WebSocket.OPEN) return;
+          client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
+        });
+      }
+
       // ─── 번호방: 나가기 (잔류자 유지, 마지막 퇴장 시 폐쇄) ───
       else if (data.type === 'room_leave') {
         const senderNickname = clients.get(ws);
