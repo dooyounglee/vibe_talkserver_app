@@ -25,6 +25,11 @@ const {
   isRegistered,
   getAllUsers,
   getAllUsersDetail,
+  bumpUnread,
+  getUnreadMap,
+  clearUnread,
+  clearUnreadForRoom,
+  getOneToOnePeer,
 } = require('./db');
 
 // 포트 8080에서 서버 실행 (테스트 시 PORT로 재지정 가능)
@@ -144,6 +149,9 @@ wss.on('connection', (ws) => {
         // 내 방 목록 전송 (삭제/폐쇄 제외)
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
 
+        // 안읽은 건수 복원 (서버 DB 기준 — 다른 PC에서 로그인해도 그대로 유지된다)
+        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(nickname) }));
+
         // NOTE: 접속 시 전체 방/DM 히스토리 일괄 푸시 제거.
         // 채팅창이 열릴 때마다(room_history / dm_history 요청) DB에서 최근 10건을 조회해 준다.
 
@@ -250,6 +258,16 @@ wss.on('connection', (ws) => {
           dmRoomId = null;
         }
 
+        // 수신자 안읽은 건수 +1 (온라인/오프라인 무관하게 DB에 쌓인다)
+        // 오프라인 중 온 메시지도 누적되어 다음 접속(다른 PC 포함) 시 배지로 표시된다.
+        bumpUnread(targetNickname, 'dm', senderNickname, now);
+
+        // DM은 1:1 방에도 저장되므로, 같은 내용에 대해 '내 채팅방' 쪽 배지도 함께 올린다.
+        // (두 탭이 같은 대화를 보여주므로 어느 탭에서 열어도 읽음이 일관되게 처리된다)
+        if (dmRoomId) {
+          bumpUnread(targetNickname, 'room', String(dmRoomId), now);
+        }
+
         // 대상이 온라인이면 실시간 전송
         if (targetClient && targetClient.readyState === WebSocket.OPEN) {
           targetClient.send(JSON.stringify({
@@ -260,6 +278,16 @@ wss.on('connection', (ws) => {
             timestamp: now,
             dmRoomId,
           }));
+          // 안읽은 배지 실시간 반영 (DB 값은 위에서 이미 증가시켜 두었다)
+          targetClient.send(JSON.stringify({
+            type: 'unread_bump', scope: 'dm', target: senderNickname,
+          }));
+          // '내 채팅방' 탭의 1:1 방 배지도 함께 갱신
+          if (dmRoomId) {
+            targetClient.send(JSON.stringify({
+              type: 'unread_bump', scope: 'room', target: String(dmRoomId),
+            }));
+          }
           // 자동방 목록/히스토리도 조용히 갱신 (방 창 자동팝업 없음)
           if (dmRoomId) {
             try {
@@ -459,6 +487,9 @@ wss.on('connection', (ws) => {
         const wasOwner = room.owner === senderNickname;
         removeMember(roomId, senderNickname);
         trackLeave(ws, roomId);
+        // 나간 방의 안읽은 건수는 의미가 없으므로 정리한다.
+        // (다시 입장하면 0부터 다시 쌓인다)
+        clearUnreadForRoom(senderNickname, roomId, Date.now());
         if (wasOwner) {
           const next = getEarliestMemberExcept(roomId, senderNickname);
           if (next) transferOwner(roomId, next);
@@ -532,6 +563,60 @@ wss.on('connection', (ws) => {
           type: 'room_last_message', roomId,
           from: senderNickname, text: payload.text, timestamp,
         });
+
+        // 방 멤버(발신자 제외) 안읽은 건수 +1.
+        // 온라인 멤버에게는 갱신 신호를 보내 배지가 바로 반영되게 하고,
+        // 오프라인 멤버는 DB에 누적되었다가 다음 접속 시 복원된다.
+        for (const member of getRoomMembers(roomId)) {
+          if (member === senderNickname) continue;
+          bumpUnread(member, 'room', String(roomId), timestamp);
+        }
+        for (const [client, nick] of clients.entries()) {
+          if (nick === senderNickname) continue;
+          if (!isMember(roomId, nick)) continue;
+          if (client.readyState !== WebSocket.OPEN) continue;
+          client.send(JSON.stringify({
+            type: 'unread_bump', scope: 'room', target: String(roomId),
+          }));
+        }
+      }
+
+      // ─── 안읽은 건수: 읽음 처리 ───
+      // 채팅창을 열거나 메시지를 읽으면 클라이언트가 이 신호를 보낸다.
+      // 서버 DB에서 0으로 갱신하므로 다른 PC/브라우저로 로그인해도 반영된다.
+      else if (data.type === 'unread_clear') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        const target = String(data.target ?? '').trim();
+        if (!target) return;
+        if (data.scope === 'room') {
+          const roomId = Number(target);
+          if (!Number.isInteger(roomId)) return;
+          // 멤버인 경우만 읽음 처리 (권한 판정은 DB 기준)
+          if (!isMember(roomId, senderNickname)) return;
+          clearUnread(senderNickname, 'room', String(roomId), Date.now());
+          // 1:1 방을 열면 '사용자' 탭의 DM 배지도 함께 지운다 (같은 대화)
+          const oneToOnePeer = getOneToOnePeer(roomId, senderNickname);
+          if (oneToOnePeer) {
+            clearUnread(senderNickname, 'dm', oneToOnePeer, Date.now());
+          }
+        } else {
+          // DM 읽음: '사용자' 탭 배지와, 같은 대화를 보여주는 1:1 방 배지를 함께 지운다.
+          // (한쪽 탭에서만 열어도 양쪽 모두 읽음 상태가 되어야 배지가 어긋나지 않는다)
+          clearUnread(senderNickname, 'dm', target, Date.now());
+          const oneToOneRoomId = findActiveOneToOneRoom(senderNickname, target);
+          if (oneToOneRoomId) {
+            clearUnread(senderNickname, 'room', String(oneToOneRoomId), Date.now());
+          }
+        }
+      }
+
+      // ─── 안읽은 건수: 현재 상태 재조회 ───
+      // 목록 갱신 없이 배지만 다시 받고 싶을 때 사용 (읽음 처리 후 확인 등)
+      else if (data.type === 'unread_query') {
+        const senderNickname = clients.get(ws);
+        if (!senderNickname) return;
+        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(senderNickname) }));
       }
 
       // ─── 번호방: 내 목록 새로고침 ───

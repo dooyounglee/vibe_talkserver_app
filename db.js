@@ -65,6 +65,113 @@ try {
   console.error('admin 시드 실패:', e);
 }
 
+// ─── 안읽은 건수 (unread) ───
+// 화면 메모리/localStorage는 기기(브라우저)별로 분리되므로 다른 PC에서 접속하면
+// 안읽은 건수가 사라진다. 서버 DB를 단일 진실로 두고 여기에 영속화한다.
+//   nickname : 소유자 (안 읽은 쪽)
+//   scope    : 'dm' | 'room'
+//   target   : dm이면 상대 닉네임, room이면 방번호(문자열)
+// 읽음 처리(0건)는 행을 즉시 삭제하지 않고 count=0으로만 갱신한다.
+// (주기 정리 여부는 보류 — 행이 적어 비용 문제 없음)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS unread (
+    nickname TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (nickname, scope, target)
+  )
+`);
+
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_unread_nick ON unread(nickname, scope)`);
+} catch (e) {
+  console.error('unread 인덱스 생성 실패:', e);
+}
+
+const bumpUnreadStmt = db.prepare(
+  `INSERT INTO unread (nickname, scope, target, count, updated_at) VALUES (?, ?, ?, 1, ?)
+   ON CONFLICT(nickname, scope, target) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at`
+);
+const setUnreadStmt = db.prepare(
+  `INSERT INTO unread (nickname, scope, target, count, updated_at) VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(nickname, scope, target) DO UPDATE SET count = excluded.count, updated_at = excluded.updated_at`
+);
+const getUnreadStmt = db.prepare(
+  `SELECT scope, target, count FROM unread WHERE nickname = ? AND count > 0`
+);
+const clearUnreadStmt = db.prepare(
+  `UPDATE unread SET count = 0, updated_at = ? WHERE nickname = ? AND scope = ? AND target = ?`
+);
+
+/** 안읽은 건수 1 증가 (받은 사람 기준) */
+function bumpUnread(nickname, scope, target, timestamp) {
+  if (!nickname || !scope || !target) return;
+  try {
+    bumpUnreadStmt.run(String(nickname), String(scope), String(target), timestamp);
+  } catch (e) {
+    console.error('안읽은 건수 증가 실패:', e);
+  }
+}
+
+/** 안읽은 건수를 지정 값으로 설정 (0이면 읽음 처리) */
+function setUnread(nickname, scope, target, count, timestamp) {
+  if (!nickname || !scope || !target) return;
+  try {
+    setUnreadStmt.run(String(nickname), String(scope), String(target), Math.max(0, Math.floor(count)), timestamp);
+  } catch (e) {
+    console.error('안읽은 건수 설정 실패:', e);
+  }
+}
+
+/**
+ * 접속 시 내려줄 안읽은 건수 전체.
+ * { dm: {상대: 건수}, room: {방번호: 건수} } 형태로 반환한다.
+ */
+function getUnreadMap(nickname) {
+  const out = { dm: {}, room: {} };
+  if (!nickname) return out;
+  try {
+    for (const row of getUnreadStmt.all(nickname)) {
+      const count = Number(row.count) || 0;
+      if (count <= 0) continue;
+      if (row.scope === 'dm') out.dm[String(row.target)] = count;
+      else if (row.scope === 'room') out.room[String(row.target)] = count;
+    }
+  } catch (e) {
+    console.error('안읽은 건수 조회 실패:', e);
+  }
+  return out;
+}
+
+/** 읽음 처리 (해당 항목만 0으로) */
+function clearUnread(nickname, scope, target, timestamp) {
+  if (!nickname || !scope || !target) return;
+  try {
+    clearUnreadStmt.run(timestamp, String(nickname), String(scope), String(target));
+  } catch (e) {
+    console.error('안읽은 건수 읽음 처리 실패:', e);
+  }
+}
+
+/**
+ * 1:1 방에서 나를 제외한 상대 닉네임 (1:1이 아니면 null).
+ * DM 채팅창과 1:1 방은 같은 대화를 보여주므로, 읽음 처리 시 양쪽 배지를 함께 정리할 때 쓴다.
+ */
+function getOneToOnePeer(roomId, nickname) {
+  const members = getRoomMembers(roomId);
+  if (members.length !== 2) return null;
+  const me = String(nickname || '').trim();
+  const other = members.find((m) => m !== me);
+  return other || null;
+}
+
+/** 방 탈퇴/삭제 시 해당 사용자의 방 안읽은 건수도 정리 */
+function clearUnreadForRoom(nickname, roomId, timestamp) {
+  clearUnread(nickname, 'room', String(roomId), timestamp);
+}
+
 // 기존 DB 마이그레이션: messages.room_id 컬럼 추가 (이미 있으면 무시)
 try {
   const cols = db.prepare(`PRAGMA table_info(messages)`).all();
@@ -505,4 +612,10 @@ module.exports = {
   isRegistered,
   getAllUsers,
   getAllUsersDetail,
+  bumpUnread,
+  setUnread,
+  getUnreadMap,
+  clearUnread,
+  clearUnreadForRoom,
+  getOneToOnePeer,
 };
