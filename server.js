@@ -5,6 +5,7 @@ const WebSocket = require('ws');
 const {
   saveMessage,
   createRoom,
+  joinMemberNames,
   getRoom,
   isRoomActive,
   isMember,
@@ -399,11 +400,6 @@ wss.on('connection', (ws) => {
       else if (data.type === 'room_create') {
         const senderNickname = clients.get(ws);
         if (!senderNickname) return;
-        const name = String(data.name || '').trim().slice(0, 30);
-        if (!name) {
-          ws.send(JSON.stringify({ type: 'system', text: '방 이름을 입력하세요.' }));
-          return;
-        }
         // 초대생성: members 배열(닉네임 목록)을 함께 받아 방 생성 시 멤버로 등록
         // 탈퇴한 사용자는 초대 대상에서 제외
         const rawMembers = Array.isArray(data.members) ? data.members : [];
@@ -411,6 +407,16 @@ wss.on('connection', (ws) => {
           .map((m) => String(m || '').trim())
           .filter((m) => m && m !== senderNickname && !isWithdrawn(m))
           .slice(0, 50);
+        // 방 이름은 직접 입력받지 않는다(클라이언트 input 제거).
+        // 실제 멤버(탈퇴자·중복 제외) 기준으로 "이름 오름차순 쉼표 연결"을 만들어
+        // rooms.name과 room_members.display_name에 동일하게 넣는다.
+        // 구버전 클라이언트가 이름을 보내는 경우에만 그 값을 폴백으로 쓴다.
+        const legacyName = String(data.name || '').trim().slice(0, 30);
+        const name = joinMemberNames(senderNickname, members) || legacyName;
+        if (!name) {
+          ws.send(JSON.stringify({ type: 'system', text: '방을 만들지 못했습니다.' }));
+          return;
+        }
         const now = Date.now();
         const roomId = createRoom({ name, owner: senderNickname, timestamp: now, members });
         trackJoin(ws, roomId);

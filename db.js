@@ -246,11 +246,22 @@ function saveMessage({ roomType, sender, receiver = null, text, timestamp, roomI
 
 // ─── 번호방 CRUD ───
 
+// 참여자 전체(방장 + 초대된 멤버) 이름을 오름차순으로 이어 붙인 기본 방 이름.
+// 예) ['lee','sam','kim'] → "kim,lee,sam"
+// 빈 값/중복은 걸러내고, 비교는 localeCompare로 한다(사용자 목록 정렬과 동일 기준).
+function joinMemberNames(owner, members = []) {
+  const names = [];
+  const seen = new Set();
+  for (const raw of [owner, ...(Array.isArray(members) ? members : [])]) {
+    const nick = String(raw ?? '').trim();
+    if (!nick || seen.has(nick)) continue;
+    seen.add(nick);
+    names.push(nick);
+  }
+  return names.sort((a, b) => a.localeCompare(b)).join(',');
+}
+
 function createRoom({ name, owner, timestamp, members = [] }) {
-  const info = db
-    .prepare(`INSERT INTO rooms (name, owner, created_at) VALUES (?, ?, ?)`)
-    .run(name, owner, timestamp);
-  const roomId = Number(info.lastInsertRowid);
   // 초대 멤버를 함께 등록 (중복/방장 제외, 빈 문자열 제외)
   const seen = new Set([owner]);
   const invited = [];
@@ -260,16 +271,25 @@ function createRoom({ name, owner, timestamp, members = [] }) {
     seen.add(nick);
     invited.push(nick);
   }
-  // 1:1 판정: owner + 초대 1명 = 총 2명일 때만 상대 닉네임을 display_name으로 저장
+  // 방 이름 미전달 시 참여자 이름 자동 연결(오름차순, 쉼표)로 기본값을 만든다.
+  const autoName = joinMemberNames(owner, invited);
+  const info = db
+    .prepare(`INSERT INTO rooms (name, owner, created_at) VALUES (?, ?, ?)`)
+    .run(String(name ?? '').trim() || autoName, owner, timestamp);
+  const roomId = Number(info.lastInsertRowid);
+  // 표시제목(display_name) 규칙
+  //   1:1(총 2명) : 각자 상대방 닉네임이 뜸 (기존 유지)
+  //   3명 이상    : 모든 참여자 이름(오름차순 쉼표 연결)을 그대로 저장
+  //                 → rooms.name 폴백 없이도 목록/창 제목이 바로 맞는다
   const isOneToOne = invited.length === 1;
-  const ownerDisplay = isOneToOne ? invited[0] : null;
+  const ownerDisplay = isOneToOne ? invited[0] : autoName;
   db.prepare(`INSERT INTO room_members (room_id, nickname, joined_at, display_name) VALUES (?, ?, ?, ?)`)
     .run(roomId, owner, timestamp, ownerDisplay);
   let seq = 1;
   for (const nick of invited) {
     try {
-      // 초대받은 멤버에게 보이는 제목 = 방장(상대) 닉네임 (1:1일 때만)
-      const memberDisplay = isOneToOne ? owner : null;
+      // 초대받은 멤버에게 보이는 제목 = 방장(상대) 닉네임 (1:1) / 참여자 전체 이름 (그룹)
+      const memberDisplay = isOneToOne ? owner : autoName;
       db.prepare(
         `INSERT OR IGNORE INTO room_members (room_id, nickname, joined_at, display_name) VALUES (?, ?, ?, ?)`
       ).run(roomId, nick, timestamp + seq, memberDisplay);
@@ -588,6 +608,7 @@ module.exports = {
   db,
   saveMessage,
   createRoom,
+  joinMemberNames,
   getRoom,
   isRoomActive,
   isMember,
