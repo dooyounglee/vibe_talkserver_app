@@ -66,17 +66,23 @@ const tieInfo = d.getMyRooms('alice').find((r) => r.roomId === tie1);
 assert(tieInfo.lastMessage === 'tie-new', 'timestamp 동률이면 나중 저장(id DESC)이 최신');
 assert(tieInfo.lastMessageSender === 'bob', '동률 판정의 발신자 일치');
 
-// 5. DM(1:1 자동방) 메시지도 목록에 반영 — DM은 방 메시지로도 저장된다
+// 5. 1:1방 메시지도 목록에 반영 — 1:1은 방 하나로만 표현된다
 const dmRoom = d.createRoom({ name: '1:1 alice,bob', owner: 'alice', timestamp: now + 4, members: ['bob'] });
-d.saveMessage({ roomType: 'dm', sender: 'bob', text: 'dm-only', timestamp: now + 60, receiver: 'alice' });
 d.saveMessage({ roomType: 'room', sender: 'bob', text: 'dm-in-room', timestamp: now + 70, roomId: dmRoom });
 const dmInfo = d.getMyRooms('alice').find((r) => r.roomId === dmRoom);
 assert(dmInfo.lastMessage === 'dm-in-room', '1:1방 마지막 메시지는 방 메시지 기준');
 assert(dmInfo.lastMessageSender === 'bob', '1:1방 발신자 일치');
 
-// 6. room_type이 다른 행(room_id=null 등)은 후보에서 제외
+// 6. 메시지가 아직 없는 1:1방은 lastMessage가 null이다.
+//    (클라이언트가 목록에서 숨길지 판단하는 근거)
+const emptyOneToOne = d.createRoom({ name: '1:1 alice,carol', owner: 'alice', timestamp: now + 5, members: ['carol'] });
+const emptyOneToOneInfo = d.getMyRooms('alice').find((r) => r.roomId === emptyOneToOne);
+assert(emptyOneToOneInfo.lastMessage === null, '메시지 없는 1:1방은 lastMessage가 null');
+assert(emptyOneToOneInfo.lastMessageAt === null, '메시지 없는 1:1방은 lastMessageAt가 null');
+
+// 7. room_id가 다른 방의 메시지는 섞이지 않는다
 const other = d.getMyRooms('alice').find((r) => r.roomId === emptyRoom);
-assert(other.lastMessage === null, 'room_id가 null인 DM 행은 다른 방에 합쳐지지 않음');
+assert(other.lastMessage === null, '다른 방의 메시지가 합쳐지지 않음');
 
 // 7. 삭제/폐쇄된 방은 목록과 함께 사라진다
 d.softDeleteRoom(roomA, 'alice', now + 80);

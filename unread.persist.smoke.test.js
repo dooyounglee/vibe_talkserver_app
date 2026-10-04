@@ -93,12 +93,11 @@ const fetchUnread = async (client) => {
 
     // 1. 최초 접속 시 unread_state로 빈 상태가 전달된다
     let unread = await fetchUnread(b);
-    assert(Object.keys(unread.dm).length === 0, '처음엔 DM 안읽은 건수 0');
     assert(Object.keys(unread.room).length === 0, '처음엔 방 안읽은 건수 0');
 
     // 2. 방 생성 (admin + root + other = 3명 그룹방)
-    // NOTE: 2명 방이면 DM의 1:1 자동방과 동일하게 판정되어 배지가 섞인다.
-    // 그룹방으로 만들어 '내 채팅방' 배지와 DM 배지를 독립적으로 검증한다.
+    // NOTE: 1:1은 별도 배지 없이 이 방 스코프 하나로 관리된다(2명 방을 만들면 1:1이 된다).
+    // 그룹방으로 만들어 '내 채팅방' 배지 하나만 검증하면 충분하다.
     a.send({ type: 'user_upsert', nickname: 'other', isDeleted: false });
     await wait(200);
     a.send({ type: 'room_create', name: '테스트방', members: ['root', 'other'] });
@@ -113,19 +112,21 @@ const fetchUnread = async (client) => {
     unread = await fetchUnread(b);
     assert(unread.room[String(roomId)] === 1, '방 안읽은 건수가 1로 누적');
 
-    // 4. DM을 받으면 DM 안읽은 건수 증가
-    b.inbox.length = 0;
-    a.send({ type: 'dm', to: 'root', text: '첫 DM' });
-    const dmBump = await b.waitFor((m) => m.type === 'unread_bump' && m.scope === 'dm');
-    assert(dmBump.target === 'admin', 'unread_bump에 상대 닉네임 포함');
+    // 4. '사용자' 탭에서 연 1:1방도 같은 방 스코프로 배지가 오른다
+    a.send({ type: 'dm_room_open', withUser: 'root' });
+    const opened = await a.waitFor((m) => m.type === 'room_opened' && m.withUser === 'root');
+    const oneToOneRoomId = opened.roomId;
+    assert(Number.isInteger(oneToOneRoomId), '1:1방 확보 후 방 번호 반환됨');
+    a.send({ type: 'room_message', roomId: oneToOneRoomId, text: '첫 1:1 메시지' });
+    await wait(400);
     unread = await fetchUnread(b);
-    assert(unread.dm.admin === 1, 'DM 안읽은 건수가 1로 누적');
+    assert(unread.room[String(oneToOneRoomId)] === 1, '1:1방 안읽은 건수가 1로 누적');
 
     // 5. 오프라인 중 도착한 메시지도 재접속(다른 PC 로그인) 시 복원된다 — 핵심 요구사항
     b.close();
     await wait(400);
     a.send({ type: 'room_message', roomId, text: '오프라인 중 방 메시지' });
-    a.send({ type: 'dm', to: 'root', text: '오프라인 중 DM' });
+    a.send({ type: 'room_message', roomId: oneToOneRoomId, text: '오프라인 중 1:1 메시지' });
     await wait(500);
 
     b = await connect('root');
@@ -133,12 +134,11 @@ const fetchUnread = async (client) => {
     await wait(400);
     unread = await fetchUnread(b);
     assert(unread.room[String(roomId)] === 2, '재접속 시 방 안읽은 건수 누적값 복원');
-    // DM 1건은 1:1 자동방에만 쌓이므로 그룹방 건수에는 영향이 없다
-    assert(unread.dm.admin === 2, '재접속 시 DM 안읽은 건수 복원');
+    assert(unread.room[String(oneToOneRoomId)] === 2, '재접속 시 1:1방 안읽은 건수 복원');
 
     // 6. 채팅창을 열면 unread_clear로 읽음 처리 → 재접속 후 0으로 유지된다
     b.send({ type: 'unread_clear', scope: 'room', target: String(roomId) });
-    b.send({ type: 'unread_clear', scope: 'dm', target: 'admin' });
+    b.send({ type: 'unread_clear', scope: 'room', target: String(oneToOneRoomId) });
     await wait(400);
     unread = await fetchUnread(b);
     assert(!unread.room[String(roomId)], '읽음 처리 후 방 배지 0');
@@ -149,7 +149,7 @@ const fetchUnread = async (client) => {
     await wait(400);
     unread = await fetchUnread(b);
     assert(!unread.room[String(roomId)], '읽음 처리한 방은 재접속 후에도 0');
-    assert(!unread.dm.admin, '읽음 처리한 DM 상대는 재접속 후에도 0');
+    assert(!unread.room[String(oneToOneRoomId)], '읽음 처리한 1:1방은 재접속 후에도 0');
 
     // 7. 방을 나가면 해당 방 안읽은 건수가 정리된다
     a.send({ type: 'room_message', roomId, text: '나가기 전 다시 쌓임' });

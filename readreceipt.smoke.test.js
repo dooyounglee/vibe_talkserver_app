@@ -76,15 +76,17 @@ const markRead = (client, scope, target) => {
 };
 
 // 히스토리를 다시 받아와 현재 숫자를 확인한다
-const fetchDmHistory = async (client, withUser) => {
-  client.inbox.length = 0;
-  client.send({ type: 'dm_history', withUser });
-  return client.waitFor((m) => m.type === 'history_dm');
-};
 const fetchRoomHistory = async (client, roomId) => {
   client.inbox.length = 0;
   client.send({ type: 'room_history', roomId });
   return client.waitFor((m) => m.type === 'history_room' && m.roomId === roomId);
+};
+// 1:1 방 확보 (find-or-create) 후 방 번호를 돌려준다
+const openOneToOneRoom = async (client, withUser) => {
+  client.inbox.length = 0;
+  client.send({ type: 'dm_room_open', withUser });
+  const opened = await client.waitFor((m) => m.type === 'room_opened' && m.withUser === withUser);
+  return opened.roomId;
 };
 
 (async () => {
@@ -109,22 +111,26 @@ const fetchRoomHistory = async (client, roomId) => {
     await wait(300);
 
     // ─── 1:1 읽음 표시 ───
+    // 1:1도 방 하나로 관리하므로 읽음 표시는 그룹방과 완전히 같은 규칙이다.
+    const oneToOneId = await openOneToOneRoom(a, 'root');
+    assert(Number.isInteger(oneToOneId), '1:1방 확보');
+
     // 1. admin 이 root 에게 보냄 → 상대(root)가 안 읽었으므로 admin 화면에 '1'
-    a.send({ type: 'dm', to: 'root', text: 'dm-1' });
+    a.send({ type: 'room_message', roomId: oneToOneId, text: 'dm-1' });
     await wait(300);
-    let hist = await fetchDmHistory(a, 'root');
+    let hist = await fetchRoomHistory(a, oneToOneId);
     assert(findUnread(hist, 'dm-1') === 1, '1:1 보낸 메시지에 안읽음 1 표시');
 
     // 2. root 가 읽음 처리 → admin 화면 숫자 사라짐 (카톡: 읽으면 '1' 이 없어진다)
-    markRead(b, 'dm', 'admin');
+    markRead(b, 'room', oneToOneId);
     await wait(300);
-    hist = await fetchDmHistory(a, 'root');
+    hist = await fetchRoomHistory(a, oneToOneId);
     assert(findUnread(hist, 'dm-1') === 0, '1:1 상대가 읽으면 숫자 사라짐');
 
     // 3. root 가 보냄 → admin 이 안 읽었으므로 root 화면에 '1'
-    b.send({ type: 'dm', to: 'admin', text: 'dm-2' });
+    b.send({ type: 'room_message', roomId: oneToOneId, text: 'dm-2' });
     await wait(300);
-    hist = await fetchDmHistory(b, 'admin');
+    hist = await fetchRoomHistory(b, oneToOneId);
     assert(findUnread(hist, 'dm-2') === 1, '1:1 반대 방향도 안읽음 1 표시');
 
     // 4. 재접속해도 유지 (DB 영속) — admin 이 아직 안 읽었으므로 '1' 이 살아있어야 한다
@@ -133,7 +139,7 @@ const fetchRoomHistory = async (client, roomId) => {
     a = await connect('admin');
     await a.ready;
     await wait(300);
-    hist = await fetchDmHistory(a, 'root');
+    hist = await fetchRoomHistory(a, oneToOneId);
     assert(findUnread(hist, 'dm-2') === 1, '재접속 후에도 안읽음 숫자 유지 (1:1)');
 
     // ─── 단체 읽음 표시 ───
@@ -294,13 +300,13 @@ const fetchRoomHistory = async (client, roomId) => {
     assert(findUnread(rootHist, 'room-5') === 0, '전원 확인 → 상대 메시지 숫자도 소멸');
 
     // 13. 1:1 도 같은 규칙 — blur 면 '나'가 세어지고, 읽음 처리하면 0
-    b.send({ type: 'dm', to: 'admin', text: 'dm-3' });
+    b.send({ type: 'room_message', roomId: oneToOneId, text: 'dm-3' });
     await wait(300);
-    hist = await fetchDmHistory(a, 'root');
+    hist = await fetchRoomHistory(a, oneToOneId);
     assert(findUnread(hist, 'dm-3') === 1, '1:1 blur 상태: 받은 메시지도 \'나\'가 집계되어 1');
-    markRead(a, 'dm', 'root');
+    markRead(a, 'room', oneToOneId);
     await wait(400);
-    hist = await fetchDmHistory(a, 'root');
+    hist = await fetchRoomHistory(a, oneToOneId);
     assert(findUnread(hist, 'dm-3') === 0, '1:1 읽음 처리 후 0');
 
     console.log('\nREAD RECEIPT SMOKE PASSED');

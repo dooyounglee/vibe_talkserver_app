@@ -69,8 +69,8 @@ try {
 // 화면 메모리/localStorage는 기기(브라우저)별로 분리되므로 다른 PC에서 접속하면
 // 안읽은 건수가 사라진다. 서버 DB를 단일 진실로 두고 여기에 영속화한다.
 //   nickname : 소유자 (안 읽은 쪽)
-//   scope    : 'dm' | 'room'
-//   target   : dm이면 상대 닉네임, room이면 방번호(문자열)
+//   scope    : 'room'
+//   target   : 방번호(문자열)
 // 읽음 처리(0건)는 행을 즉시 삭제하지 않고 count=0으로만 갱신한다.
 // (주기 정리 여부는 보류 — 행이 적어 비용 문제 없음)
 db.exec(`
@@ -127,17 +127,16 @@ function setUnread(nickname, scope, target, count, timestamp) {
 
 /**
  * 접속 시 내려줄 안읽은 건수 전체.
- * { dm: {상대: 건수}, room: {방번호: 건수} } 형태로 반환한다.
+ * { room: {방번호: 건수} } 형태로 반환한다.
  */
 function getUnreadMap(nickname) {
-  const out = { dm: {}, room: {} };
+  const out = { room: {} };
   if (!nickname) return out;
   try {
     for (const row of getUnreadStmt.all(nickname)) {
       const count = Number(row.count) || 0;
       if (count <= 0) continue;
-      if (row.scope === 'dm') out.dm[String(row.target)] = count;
-      else if (row.scope === 'room') out.room[String(row.target)] = count;
+      if (row.scope === 'room') out.room[String(row.target)] = count;
     }
   } catch (e) {
     console.error('안읽은 건수 조회 실패:', e);
@@ -155,18 +154,6 @@ function clearUnread(nickname, scope, target, timestamp) {
   }
 }
 
-/**
- * 1:1 방에서 나를 제외한 상대 닉네임 (1:1이 아니면 null).
- * DM 채팅창과 1:1 방은 같은 대화를 보여주므로, 읽음 처리 시 양쪽 배지를 함께 정리할 때 쓴다.
- */
-function getOneToOnePeer(roomId, nickname) {
-  const members = getRoomMembers(roomId);
-  if (members.length !== 2) return null;
-  const me = String(nickname || '').trim();
-  const other = members.find((m) => m !== me);
-  return other || null;
-}
-
 /** 방 탈퇴/삭제 시 해당 사용자의 방 안읽은 건수도 정리 */
 function clearUnreadForRoom(nickname, roomId, timestamp) {
   clearUnread(nickname, 'room', String(roomId), timestamp);
@@ -182,9 +169,9 @@ function clearUnreadForRoom(nickname, roomId, timestamp) {
 // 로 판정할 수 있다. (메시지별 플래그보다 행 수가 훨씬 적다)
 // 화면 메모리로는 로그아웃/다른 PC 접속 시 숫자가 사라지므로 DB에 영속화한다.
 //   nickname : 읽은 사람
-//   scope    : 'dm' | 'room'
-//   target   : dm이면 상대 닉네임, room이면 방번호(문자열)
-//              (unread 테이블과 동일 규약 → DM창/1:1방창을 하나의 대화로 처리 가능)
+//   scope    : 'room'
+//   target   : 방번호(문자열)
+//              (unread 테이블과 동일 규약)
 db.exec(`
   CREATE TABLE IF NOT EXISTS read_cursor (
     nickname TEXT NOT NULL,
@@ -259,24 +246,8 @@ function getLatestRoomMessageId(roomId) {
   }
 }
 
-// 1:1에서 읽음 처리 시 기준이 되는 최신 메시지 id (dm 행 기준)
-function getLatestDmMessageId(nickname, withUser) {
-  const me = String(nickname || '').trim();
-  const peer = String(withUser || '').trim();
-  if (!me || !peer || me === peer) return 0;
-  try {
-    const row = db
-      .prepare(
-        `SELECT MAX(id) AS id FROM messages
-         WHERE room_type = 'dm'
-           AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))`
-      )
-      .get(me, peer, peer, me);
-    return row && row.id ? Number(row.id) : 0;
-  } catch {
-    return 0;
-  }
-}
+// 1:1은 두 사용자의 방이다. 1:1 "창"이라는 별도 개념이 없으므로
+// 읽음 커서도 방 스코프 하나로만 관리한다.
 
 /**
  * 한 메시지를 아직 안 읽은 사람 수 (카톡의 '1' / '4' 숫자).
@@ -379,6 +350,24 @@ try {
   console.error('1:1방 제목 백필 실패:', e);
 }
 
+// ─── DM 경로 완전 제거에 따른 1회성 정리 ───
+// 1:1은 이제 "멤버 2명 방" 하나로만 표현한다. 예전에 1:1 DM을 보낼 때
+// room_type='dm' 행이 따로 쌓였고, unread/read_cursor에도 scope='dm' 행이 남았다.
+// 이 행들은 더 이상 읽는 곳이 없으므로 정리한다(1:1 방 쪽에 사본이 이미 있다).
+try {
+  const delMsgs = db.prepare(`DELETE FROM messages WHERE room_type = 'dm'`).run();
+  const delUnread = db.prepare(`DELETE FROM unread WHERE scope = 'dm'`).run();
+  const delCursor = db.prepare(`DELETE FROM read_cursor WHERE scope = 'dm'`).run();
+  const removed = delMsgs.changes + delUnread.changes + delCursor.changes;
+  if (removed > 0) {
+    console.log(
+      `DM 경로 정리: 메시지 ${delMsgs.changes}건, 안읽은 ${delUnread.changes}건, 읽음커서 ${delCursor.changes}건`,
+    );
+  }
+} catch (e) {
+  console.error('DM 경로 정리 실패:', e);
+}
+
 try {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, timestamp, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_room_members_nick ON room_members(nickname, room_id)`);
@@ -392,8 +381,8 @@ const insertMessageStmt = db.prepare(
   'INSERT INTO messages (room_type, sender, receiver, text, timestamp, room_id) VALUES (?, ?, ?, ?, ?, ?)'
 );
 
-// 메시지 저장 (roomType: "dm" | "room", receiver는 dm일 때만 값, roomId는 room일 때만 값)
-// NOTE: 기존 'group' 행은 DB에 그대로 두지만 신규 저장은 하지 않는다.
+// 메시지 저장 (roomType: "room", roomId는 방번호)
+// NOTE: 'dm'/'group' 행은 더 이상 저장하지 않는다(1:1도 방으로 저장).
 function saveMessage({ roomType, sender, receiver = null, text, timestamp, roomId = null }) {
   return insertMessageStmt.run(roomType, sender, receiver, text, timestamp, roomId);
 }
@@ -470,8 +459,8 @@ function isMember(roomId, nickname) {
   return !!row;
 }
 
-// ─── 1:1 자동방: 활성(삭제/폐쇄 제외) + 멤버 정확히 2명(a,b)인 방 조회 ───
-// DM 첫 전송 시점에 find-or-create 용. 그룹방(3명+)은 절대 매칭되지 않음.
+// ─── 1:1 방: 활성(삭제/폐쇄 제외) + 멤버 정확히 2명(a,b)인 방 조회 ───
+// 그룹방(3명+)은 절대 매칭되지 않음.
 function findActiveOneToOneRoom(nickA, nickB) {
   const a = String(nickA || '').trim();
   const b = String(nickB || '').trim();
@@ -495,6 +484,26 @@ function findActiveOneToOneRoom(nickA, nickB) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 1:1 대화용 방을 "있다면 그대로, 없으면 생성"하고 방번호를 돌려준다.
+ * '사용자' 탭에서 상대를 눌러 1:1 창을 여는 시점에 이 함수를 쓴다.
+ * (메시지를 아직 보내지 않아도 방이 생기지만, 메시지 0개인 1:1방은
+ *  목록에서 숨기므로 빈 방이 사용자에게 보이는 일은 없다)
+ */
+function ensureOneToOneRoom(nickA, nickB, timestamp) {
+  const a = String(nickA || '').trim();
+  const b = String(nickB || '').trim();
+  if (!a || !b || a === b) return null;
+  const found = findActiveOneToOneRoom(a, b);
+  if (found) return found;
+  return createRoom({
+    name: `1:1 ${a},${b}`,
+    owner: a,
+    timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now(),
+    members: [b],
+  });
 }
 
 function addMember(roomId, nickname, timestamp) {
@@ -675,28 +684,6 @@ function getRecentRoomMessages(roomId, limit = 10) {
   }));
 }
 
-// 채팅창 열람용: 두 사람 사이 1:1 최근 N건 (기본 10건, 오래된 → 최신 순)
-function getRecentDmMessages(nickname, withUser, limit = 10) {
-  const me = String(nickname || '').trim();
-  const peer = String(withUser || '').trim();
-  if (!me || !peer || me === peer) return [];
-  const rows = db
-    .prepare(
-      `SELECT id, sender, text, timestamp FROM messages
-       WHERE room_type = 'dm'
-         AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
-       ORDER BY timestamp DESC, id DESC
-       LIMIT ?`
-    )
-    .all(me, peer, peer, me, limit);
-  return rows.reverse().map((row) => ({
-    id: Number(row.id),
-    nickname: row.sender,
-    text: row.text,
-    timestamp: row.timestamp,
-  }));
-}
-
 // ─── 등록 사용자 (users) ───
 // admin이 직접 추가/수정. 목록은 탈퇴(is_deleted=1) 제외.
 function upsertUser(nickname, timestamp, isDeleted = false) {
@@ -771,6 +758,7 @@ module.exports = {
   isRoomActive,
   isMember,
   findActiveOneToOneRoom,
+  ensureOneToOneRoom,
   addMember,
   removeMember,
   countMembers,
@@ -784,7 +772,6 @@ module.exports = {
   closeRoomIfEmpty,
   getRoomHistory,
   getRecentRoomMessages,
-  getRecentDmMessages,
   upsertUser,
   withdrawUser,
   isWithdrawn,
@@ -796,13 +783,11 @@ module.exports = {
   getUnreadMap,
   clearUnread,
   clearUnreadForRoom,
-  getOneToOnePeer,
   // 읽음 커서 (메시지별 '안 읽은 사람 수' 표시)
   markRead,
   getReadCursors,
   clearReadCursor,
   getLatestRoomMessageId,
-  getLatestDmMessageId,
   countUnreadForMessage,
   decorateUnreadCounts,
 };

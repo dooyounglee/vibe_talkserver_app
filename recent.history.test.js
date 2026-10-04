@@ -55,43 +55,41 @@ assert(dbm.getRecentRoomMessages(roomId, 3).length === 3, '방 최근 조회 lim
 assert(dbm.getRecentRoomMessages(9999, 10).length === 0, '없는 방은 빈 배열');
 
 // ─── 1:1 최근 N건 조회 ───
+// 1:1은 "멤버 2명 방"으로만 표현하므로 getRecentRoomMessages 로 조회한다.
+const dmRoom = dbm.createRoom({ name: '1:1 alice,bob', owner: 'alice', timestamp: now + 100, members: ['bob'] });
 for (let i = 0; i < 14; i++) {
   dbm.saveMessage({
-    roomType: 'dm',
+    roomType: 'room',
     sender: i % 2 === 0 ? 'alice' : 'bob',
-    receiver: i % 2 === 0 ? 'bob' : 'alice',
     text: `dm-${i}`,
     timestamp: now + 100 + i,
+    roomId: dmRoom,
   });
 }
-// 무관한 제3자 DM (결과에 섞이면 안 됨)
+// 무관한 제3자 방 (결과에 섞이면 안 됨)
+const carolRoom = dbm.createRoom({ name: '1:1 alice,carol', owner: 'alice', timestamp: now + 200, members: ['carol'] });
 dbm.saveMessage({
-  roomType: 'dm',
+  roomType: 'room',
   sender: 'alice',
-  receiver: 'carol',
   text: 'dm-carol',
-  timestamp: now + 200,
+  timestamp: now + 300,
+  roomId: carolRoom,
 });
 
-const dmRecent = dbm.getRecentDmMessages('alice', 'bob', 10);
+const dmRecent = dbm.getRecentRoomMessages(dmRoom, 10);
 assert(dmRecent.length === 10, '1:1 최근 조회는 10건만 반환');
 assert(dmRecent[0].text === 'dm-4', '1:1은 가장 오래된 것부터 (dm-4)');
 assert(dmRecent[9].text === 'dm-13', '1:1은 최신 메시지로 끝남 (dm-13)');
 assert(
   dmRecent.every((m) => m.text !== 'dm-carol'),
-  '제3자와의 DM은 결과에서 제외'
+  '다른 방의 메시지는 결과에서 제외'
 );
 assert(
-  dbm.getRecentDmMessages('bob', 'alice', 10)[0].text === 'dm-4',
-  '역순 조회도 동일 결과 (양방향)'
-);
-assert(
-  dbm.getRecentDmMessages('alice', 'bob', 3).length === 3,
+  dbm.getRecentRoomMessages(dmRoom, 3).length === 3,
   '1:1 최근 조회 limit 지정 가능'
 );
-assert(dbm.getRecentDmMessages('alice', 'carol', 10).length === 1, 'carol과의 DM 1건');
-assert(dbm.getRecentDmMessages('alice', 'alice', 10).length === 0, '본인 자신은 빈 배열');
-assert(dbm.getRecentDmMessages('', 'bob', 10).length === 0, '빈 닉네임은 빈 배열');
+assert(dbm.getRecentRoomMessages(carolRoom, 10).length === 1, '다른 1:1방은 1건');
+assert(dbm.getRecentRoomMessages(9999, 10).length === 0, '없는 방은 빈 배열');
 
 console.log('\nALL RECENT HISTORY TESTS PASSED');
 

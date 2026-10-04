@@ -113,16 +113,18 @@ const listTitleOf = async (client, roomId) => {
 
     // ─── 2. 1:1방도 동일하게 수정된다 ───
     admin.inbox.length = 0;
-    admin.send({ type: 'dm', to: 'root', text: '첫 DM' });
-    await wait(700);
+    admin.send({ type: 'dm_room_open', withUser: 'root' });
+    const opened = await admin.waitFor((m) => m.type === 'room_opened' && m.withUser === 'root');
+    const oneToOneRoomId = opened.roomId;
+    assert(Number.isInteger(oneToOneRoomId), '1:1방 확보 후 방 번호 반환됨');
     admin.inbox.length = 0;
     admin.send({ type: 'room_list' });
-    const afterDm = await admin.waitFor((m) => m.type === 'my_rooms');
-    const oneToOne = afterDm.rooms.find((r) => r.memberCount === 2);
-    assert(!!oneToOne, 'DM 후 1:1방 자동 생성됨');
-    assert(await renameAndFetch(admin, oneToOne.roomId, 'my admin dm') === 'my admin dm',
+    const afterOpen = await admin.waitFor((m) => m.type === 'my_rooms');
+    const oneToOne = afterOpen.rooms.find((r) => r.roomId === oneToOneRoomId);
+    assert(!!oneToOne, '1:1방이 내 목록에 포함됨');
+    assert(await renameAndFetch(admin, oneToOneRoomId, 'my admin dm') === 'my admin dm',
       '1:1방도 방제목 수정 가능');
-    assert(await listTitleOf(root, oneToOne.roomId) !== 'my admin dm',
+    assert(await listTitleOf(root, oneToOneRoomId) !== 'my admin dm',
       '1:1방도 상대방 제목에는 영향 없음');
 
     // ─── 3. 예외 처리 ───

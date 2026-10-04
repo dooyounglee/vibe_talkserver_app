@@ -95,21 +95,24 @@ const connect = (nickname) =>
     // 1. 접속 시 일괄 히스토리가 오지 않음을 확인
     assert(
       !a.inbox.some((m) => m.type === 'history_room' || m.type === 'history_dm'),
-      '접속 시 일괄 히스토리(history_room/history_dm) 미수신'
+      '접속 시 일괄 히스토리 미수신'
     );
 
-    // 2. DM 15건 전송 → 채팅창 열람 시 최근 10건 수신
+    // 2. '사용자' 탭에서 1:1 창을 열면 방이 확보되고, 그 방으로 recent 10건이 조회된다
+    a.send({ type: 'dm_room_open', withUser: 'root' });
+    const opened = await a.waitFor((m) => m.type === 'room_opened' && m.withUser === 'root');
+    const dmRoomId = opened.roomId;
+    assert(Number.isInteger(dmRoomId), '1:1방 확보 후 방 번호 반환됨');
     for (let i = 0; i < 15; i++) {
-      a.send({ type: 'dm', to: 'root', text: `dm-${i}` });
+      a.send({ type: 'room_message', roomId: dmRoomId, text: `dm-${i}` });
     }
     await wait(400);
     a.inbox.length = 0;
-    a.send({ type: 'dm_history', withUser: 'root' });
-    const dmHist = await a.waitFor((m) => m.type === 'history_dm');
-    assert(dmHist.messages.length === 10, 'dm_history 응답이 10건');
+    a.send({ type: 'room_history', roomId: dmRoomId });
+    const dmHist = await a.waitFor((m) => m.type === 'history_room' && m.roomId === dmRoomId);
+    assert(dmHist.messages.length === 10, '1:1방 최근 10건 응답');
     assert(dmHist.messages[0].text === 'dm-5', '가장 최근 10건의 시작점이 dm-5');
     assert(dmHist.messages[9].text === 'dm-14', '최신 dm-14로 끝남');
-    assert(dmHist.withUser === 'root', 'withUser 반환');
 
     // 3. 번호방 생성 + 메시지 15건 → room_history로 최근 10건
     a.send({ type: 'room_create', name: '스모크방' });
@@ -134,38 +137,48 @@ const connect = (nickname) =>
     const missing = await a.waitFor((m) => m.type === 'history_room' && m.roomId === 999999);
     assert(Array.isArray(missing.messages) && missing.messages.length === 0, '없는 방은 빈 히스토리');
 
-    // 5. 1:1 자동방: dm_history는 방 히스토리를 소스로 (방에서 보낸 메시지 포함)
+    // 5. 1:1방은 한 번 확보되면 같은 방이 재사용된다 (중복방 생성 방지)
     a.inbox.length = 0;
-    a.send({ type: 'dm', to: 'root', text: 'dm-extra' });
-    const roomsMsg = await a.waitFor((m) => m.type === 'my_rooms');
-    const oneToOne = roomsMsg.rooms.find(
-      (r) => r.memberCount === 2 && r.name === '1:1 admin,root',
-    );
-    assert(oneToOne, 'DM으로 자동 생성된 1:1방 존재');
-    a.send({ type: 'room_message', roomId: oneToOne.roomId, text: 'room-only-msg' });
+    a.send({ type: 'dm_room_open', withUser: 'root' });
+    const reopened = await a.waitFor((m) => m.type === 'room_opened' && m.withUser === 'root');
+    assert(reopened.roomId === dmRoomId, '같은 상대는 같은 1:1방을 재사용');
+    a.send({ type: 'room_message', roomId: dmRoomId, text: 'room-only-msg' });
     await wait(300);
     a.inbox.length = 0;
-    a.send({ type: 'dm_history', withUser: 'root' });
+    a.send({ type: 'room_history', roomId: dmRoomId });
     const roomSourced = await a.waitFor(
-      (m) => m.type === 'history_dm' && m.withUser === 'root',
+      (m) => m.type === 'history_room' && m.roomId === dmRoomId,
     );
     assert(
       roomSourced.messages.some((m) => m.text === 'room-only-msg'),
-      'dm_history가 1:1방 히스토리(방에서 보낸 메시지 포함)로 응답'
+      '1:1방 히스토리에 방에서 보낸 메시지가 포함'
     );
 
-    // 6. 1:1방이 없는 사용자 쌍 → 빈 배열 (클라이언트는 empty 문구 표시)
+    // 6. 아직 대화하지 않은 상대는 새 방이 만들어진다
     a.send({ type: 'user_upsert', nickname: 'stranger', isDeleted: false });
     await wait(200);
     a.inbox.length = 0;
-    a.send({ type: 'dm_history', withUser: 'stranger' });
-    const noRoom = await a.waitFor(
-      (m) => m.type === 'history_dm' && m.withUser === 'stranger',
+    a.send({ type: 'dm_room_open', withUser: 'stranger' });
+    const fresh = await a.waitFor((m) => m.type === 'room_opened' && m.withUser === 'stranger');
+    assert(
+      Number.isInteger(fresh.roomId) && fresh.roomId !== dmRoomId,
+      '첫 대화 상대를 누르면 새 1:1방 생성'
+    );
+    a.inbox.length = 0;
+    a.send({ type: 'room_history', roomId: fresh.roomId });
+    const noMsg = await a.waitFor(
+      (m) => m.type === 'history_room' && m.roomId === fresh.roomId,
     );
     assert(
-      Array.isArray(noRoom.messages) && noRoom.messages.length === 0,
-      '1:1방이 없으면 빈 배열'
+      Array.isArray(noMsg.messages) && noMsg.messages.length === 0,
+      '메시지 0개인 새 1:1방은 빈 히스토리'
     );
+
+    // 7. 미등록 사용자에게는 방을 만들지 않는다
+    a.inbox.length = 0;
+    a.send({ type: 'dm_room_open', withUser: 'ghost' });
+    const denied = await a.waitFor((m) => m.type === 'system');
+    assert(String(denied.text).includes('ghost'), '미등록 사용자에는 방 생성 거부');
 
     console.log('\nSMOKE TEST PASSED');
     a.close(); b.close();
