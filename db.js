@@ -300,6 +300,11 @@ function countUnreadForMessage(cursors, participants, senderNickname, messageId)
 /**
  * 메시지 배열에 안 읽은 사람 수(unreadCount)를 붙여 돌려준다.
  * messages 항목은 { id, nickname, text, timestamp } 형태여야 한다.
+ *
+ * NOTE: 클라이언트는 카톡식 숫자를 실시간으로 재계산하기 위해
+ *   서버 messages.id 값을 'msgId' 필드로 읽는다 (useChatSocket.ts).
+ *   여기서 'id'로만 내려주면 그 값이 undefined 가 되어
+ *   숫자가 한 번에 사라지는 문제가 생기므로, 반드시 msgId 로 함께 내려준다.
  */
 function decorateUnreadCounts(scope, target, messages, participants) {
   const list = Array.isArray(messages) ? messages : [];
@@ -307,6 +312,8 @@ function decorateUnreadCounts(scope, target, messages, participants) {
   const cursors = getReadCursors(scope, target);
   return list.map((m) => ({
     ...m,
+    // 읽음 숫자 재계산용 id (클라이언트 계약 필드)
+    msgId: Number(m.id) || 0,
     unreadCount: countUnreadForMessage(cursors, participants, m.nickname, m.id),
   }));
 }

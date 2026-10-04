@@ -86,16 +86,31 @@ function broadcastToRoom(roomId, message) {
   });
 }
 
+/** read_ack 에 실어 보낼 참여자 목록 (room=방 멤버, dm=대화 키의 두 당사자) */
+function readAckParticipants(scope, target) {
+  if (scope === 'room') {
+    const roomId = Number(target);
+    if (!Number.isInteger(roomId)) return [];
+    return getRoomMembers(roomId);
+  }
+  // dm: target 은 dmCursorTarget 정규화 키("A|B") — 그 두 사람이 곧 참여자다.
+  return String(target || '').split('|').filter((n) => n && n.trim() !== '');
+}
+
 // ─── 읽음 변경 알림 (카톡의 '1' 숫자가 실시간으로 줄어드는 동작) ───
 // 누군가 대화를 읽으면 그 대화의 모든 참여자에게 알려 준다.
 // 각 클라이언트는 자신이 보낸 메시지의 숫자만 다시 계산해 갱신한다.
 function broadcastReadAck(scope, target) {
   // 최신 커서 맵을 함께 실어 보내면 클라이언트가 재요청 없이 숫자를 갱신할 수 있다.
+  // members(참여자)도 함께 실어 보낸다 — 클라이언트가 "아직 안 읽은 사람 수"를
+  // 계산하려면 '몇 명인지'(참여자 목록)와 '누가 어디까지 읽었는지'(cursors) 둘 다 필요하고,
+  // 둘 중 하나가 비면 숫자가 0으로 잘못 계산되어 한 번에 사라진다.
   const payload = JSON.stringify({
     type: 'read_ack',
     scope,
     target: String(target),
     cursors: getReadCursors(scope, String(target)),
+    members: readAckParticipants(scope, String(target)),
   });
   if (scope === 'room') {
     const roomId = Number(target);
@@ -373,7 +388,13 @@ wss.on('connection', (ws) => {
                 type: 'my_rooms', rooms: getMyRooms(targetNickname),
               }));
               targetClient.send(JSON.stringify({
-                type: 'history_room', roomId: dmRoomId, messages: peerHistory,
+                type: 'history_room', roomId: dmRoomId,
+                messages: decorateUnreadCounts(
+                  'room',
+                  String(dmRoomId),
+                  peerHistory,
+                  peerMembers,
+                ),
               }));
               targetClient.send(JSON.stringify({
                 type: 'room_members', roomId: dmRoomId, members: peerMembers,
@@ -408,7 +429,13 @@ wss.on('connection', (ws) => {
               type: 'my_rooms', rooms: getMyRooms(senderNickname),
             }));
             ws.send(JSON.stringify({
-              type: 'history_room', roomId: dmRoomId, messages: selfHistory,
+              type: 'history_room', roomId: dmRoomId,
+              messages: decorateUnreadCounts(
+                'room',
+                String(dmRoomId),
+                selfHistory,
+                selfMembers,
+              ),
             }));
             ws.send(JSON.stringify({
               type: 'room_members', roomId: dmRoomId, members: selfMembers,
@@ -481,6 +508,9 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({
           type: 'history_room',
           roomId,
+          // members 를 같이 보내 방을 연 클라이언트가 즉시 참여자 목록을 갖게 한다.
+          // (이 목록이 없으면 이후 read_ack 로 숫자를 재계산할 때 0으로 잘못 계산된다)
+          members: getRoomMembers(roomId),
           messages: decorateUnreadCounts(
             'room',
             String(roomId),
@@ -569,7 +599,11 @@ wss.on('connection', (ws) => {
         }
         trackJoin(ws, roomId);
         ws.send(JSON.stringify({
-          type: 'history_room', roomId,
+          type: 'history_room',
+          roomId,
+          // members 를 같이 보내 방을 연 클라이언트가 즉시 참여자 목록을 갖게 한다.
+          // (이 목록이 없으면 이후 read_ack 로 숫자를 재계산할 때 0으로 잘못 계산된다)
+          members: getRoomMembers(roomId),
           messages: decorateUnreadCounts(
             'room',
             String(roomId),

@@ -181,9 +181,83 @@ const fetchRoomHistory = async (client, roomId) => {
     );
     assert(!!ack && Number(ack.cursors?.root) > 0, '읽음 시 read_ack 실시간 전송 (커서 포함)');
 
+    // 10-1. read_ack 가 클라이언트 재계산에 필요한 값(참여자 + msgId)을 모두 실어 보내는지
+    //       이게 없으면 화면 숫자가 '한 명 읽음 → 0' 으로 한 번에 사라진다 (회귀 방지)
+    assert(
+      Array.isArray(ack.members) && ack.members.includes('admin')
+        && ack.members.includes('root') && ack.members.includes('other'),
+      'read_ack 에 참여자 목록(members)이 포함됨 — 숫자 재계산에 필수',
+    );
+
+    // ─── 실시간 감소: 클라이언트가 실제로 숫자를 "하나씩" 줄이는지 ───
+    // 새 메시지를 보내고, 히스토리(msgId 확보) → root 읽음 → other 읽음 순으로 진행한다.
+    a.send({ type: 'room_message', roomId, text: 'room-3' });
+    await wait(400);
+    a.inbox.length = 0;
+    a.send({ type: 'room_history', roomId });
+    const histAck = await a.waitFor((m) => m.type === 'history_room' && m.roomId === roomId);
+    const msg3 = (histAck.messages ?? []).find((m) => m.text === 'room-3');
+    assert(
+      typeof msg3?.msgId === 'number' && msg3.msgId > 0,
+      'room_history 메시지에 msgId 포함 — 숫자 재계산에 필수',
+    );
+    assert(
+      Array.isArray(histAck.members) && histAck.members.length === 3,
+      'room_history 에 참여자 목록(members)이 포함됨',
+    );
+    // 클라이언트 재계산 규칙(useChatSocket.ts countUnread)을 그대로 적용한다.
+    // id 를 모르면 null(=계산 불가, 기존 값 유지)을 돌려야 한다.
+    // 0 을 돌리면 "한 번에 사라짐" 버그가 되므로 회귀 검증의 핵심이다.
+    const clientCount = (cursors, members, sender, msgId) => {
+      if (!msgId) return null;
+      let n = 0;
+      for (const nick of members || []) {
+        if (!nick || nick === sender) continue;
+        if ((cursors?.[nick] ?? 0) < msgId) n += 1;
+      }
+      return n;
+    };
+
+    // (1) root 만 읽음 → 2 → 1 로 하나씩 감소해야 한다
+    markRead(b, 'room', roomId);
+    const ack2 = await a.waitFor(
+      (m) => m.type === 'read_ack' && m.scope === 'room'
+        && Number(m.cursors?.root || 0) >= msg3.msgId
+        && Number(m.cursors?.other || 0) < msg3.msgId,
+    );
+    assert(
+      clientCount(ack2.cursors, ack2.members, 'admin', msg3.msgId) === 1,
+      '실시간 감소: root 읽음 → 2 에서 1 로 하나만 감소 (한 번에 사라지지 않음)',
+    );
+
+    // (2) other 도 읽음 → 0 으로 소멸
+    markRead(c, 'room', roomId);
+    const ack3 = await a.waitFor(
+      (m) => m.type === 'read_ack' && m.scope === 'room'
+        && Number(m.cursors?.other || 0) >= msg3.msgId,
+    );
+    assert(
+      clientCount(ack3.cursors, ack3.members, 'admin', msg3.msgId) === 0,
+      '실시간 감소: other 까지 읽음 → 숫자 소멸',
+    );
+
+    // (3) 읽지 않은 채로 발신자가 재접속 → 히스토리에서도 2 로 복원되어야 한다
+    a.send({ type: 'room_message', roomId, text: 'room-4' });
+    await wait(300);
+    a.close();
+    await wait(300);
+    a = await connect('admin');
+    await a.ready;
+    await wait(300);
+    roomHist = await fetchRoomHistory(a, roomId);
+    assert(findUnread(roomHist, 'room-4') === 2, '단체: 재접속 후에도 안읽음 2 유지');
+
     // 11. 내가 읽은 뒤에는 상대 메시지도 숫자 0 으로 계산된다 (오버카운트 없음)
+    // root 만 room-4 까지 읽으면 → other 입장에서 아직 안 읽은 사람은 other 뿐이므로 1
+    markRead(b, 'room', roomId);
+    await wait(400);
     roomHist = await fetchRoomHistory(c, roomId);
-    assert(findUnread(roomHist, 'room-2') === 1, '상대 입장에서 미열람 메시지는 1 로 계산');
+    assert(findUnread(roomHist, 'room-4') === 1, '상대 입장에서 미열람 메시지는 1 로 계산');
 
     console.log('\nREAD RECEIPT SMOKE PASSED');
     a.close(); b.close(); c.close();
