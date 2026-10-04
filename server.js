@@ -86,6 +86,21 @@ function broadcastToRoom(roomId, message) {
   });
 }
 
+// 방 멤버마다 payload 를 따로 만들어 발송한다.
+// 읽음 숫자(unreadCount)는 '지금 화면을 보는 사람'을 제외해 계산해야 해서
+//   같은 메시지라도 사람마다 값이 다르다. (예: 3명 방, A 발신 / B 열람 중 / C 미열람
+//   → A 화면 '2', B 화면 '1', C 화면 '1')
+function broadcastToRoomPerViewer(roomId, build) {
+  wss.clients.forEach(client => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    const nick = clients.get(client);
+    if (!nick) return;
+    if (!isMember(roomId, nick)) return;
+    trackJoin(client, roomId);
+    client.send(JSON.stringify(build(nick)));
+  });
+}
+
 /** read_ack 에 실어 보낼 참여자 목록 (room=방 멤버, dm=대화 키의 두 당사자) */
 function readAckParticipants(scope, target) {
   if (scope === 'room') {
@@ -297,12 +312,15 @@ wss.on('connection', (ws) => {
         const dmMsgId = Number(savedDm?.lastInsertRowid || 0);
         // 1:1 대화 참여자 = 나 + 상대.
         const dmParticipants = [senderNickname, targetNickname];
-        // 방금 보낸 메시지는 상대가 아직 못 읽었으므로 카톡과 같이 '1' 로 시작한다.
+        const dmCursors = getReadCursors('dm', dmCursorTarget(senderNickname, targetNickname));
+        // 발신자 화면 숫자: 방금 보낸 메시지는 상대가 아직 못 읽었으므로 카톡과 같이 '1' 로 시작한다.
         const dmUnreadCount = countUnreadForMessage(
-          getReadCursors('dm', dmCursorTarget(senderNickname, targetNickname)),
-          dmParticipants,
-          senderNickname,
-          dmMsgId,
+          dmCursors, dmParticipants, senderNickname, dmMsgId, senderNickname,
+        );
+        // 수신자 화면 숫자: 1:1 은 나(상대)와 발신자만이라 남는 사람이 없다 → 항상 0.
+        // (받은 메시지에 숫자가 붙지 않는 카톡 동작. 숫자를 붙이려면 3명 이상이어야 한다)
+        const dmUnreadForTarget = countUnreadForMessage(
+          dmCursors, dmParticipants, senderNickname, dmMsgId, targetNickname,
         );
 
         // 대상 클라이언트 찾기
@@ -367,7 +385,8 @@ wss.on('connection', (ws) => {
             dmRoomId,
             // 읽음 숫자 계산용 id (수신자 화면에서는 안 쓰지만 히스토리와 동일한 형태를 유지)
             msgId: dmMsgId,
-            unreadCount: dmUnreadCount,
+            // 수신자 화면 기준 숫자 (지금 보는 '나'는 집계에서 제외된다)
+            unreadCount: dmUnreadForTarget,
           }));
           // 안읽은 배지 실시간 반영 (DB 값은 위에서 이미 증가시켜 두었다)
           targetClient.send(JSON.stringify({
@@ -394,6 +413,7 @@ wss.on('connection', (ws) => {
                   String(dmRoomId),
                   peerHistory,
                   peerMembers,
+                  targetNickname, // 받는 사람 기준으로 계산 (지금 보는 '나' 제외)
                 ),
               }));
               targetClient.send(JSON.stringify({
@@ -435,6 +455,7 @@ wss.on('connection', (ws) => {
                 String(dmRoomId),
                 selfHistory,
                 selfMembers,
+                senderNickname, // 받는 사람 기준으로 계산 (지금 보는 '나' 제외)
               ),
             }));
             ws.send(JSON.stringify({
@@ -484,6 +505,7 @@ wss.on('connection', (ws) => {
             String(oneToOneRoomId),
             messages,
             getRoomMembers(oneToOneRoomId),
+            senderNickname, // 요청한 사람 기준 (지금 보는 '나' 제외)
           );
         }
         ws.send(JSON.stringify({
@@ -516,6 +538,7 @@ wss.on('connection', (ws) => {
             String(roomId),
             getRecentRoomMessages(roomId, 10),
             getRoomMembers(roomId),
+            senderNickname, // 요청한 사람 기준 (지금 보는 '나' 제외)
           ),
         }));
       }
@@ -609,6 +632,7 @@ wss.on('connection', (ws) => {
             String(roomId),
             getRecentRoomMessages(roomId, 10),
             getRoomMembers(roomId),
+            senderNickname, // 요청한 사람 기준 (지금 보는 '나' 제외)
           ),
         }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
@@ -749,13 +773,16 @@ wss.on('connection', (ws) => {
         // 발신자 본인 화면에서 카톡식 숫자로 표시되고, 상대가 읽으면 나중에 감소한다.
         const roomMsgId = Number(savedRoom?.lastInsertRowid || 0);
         payload.msgId = roomMsgId;
-        payload.unreadCount = countUnreadForMessage(
-          getReadCursors('room', String(roomId)),
-          roomMembers,
-          senderNickname,
-          roomMsgId,
-        );
-        broadcastToRoom(roomId, payload);
+        // 숫자는 '지금 보는 사람'을 제외해 계산하므로 수신자마다 값이 달라
+        // 한 번에 브로드캐스트하지 않고 멤버별로 만들어 보낸다.
+        // 발신자 화면: 본인 메시지 옆 카톡식 숫자 → 상대가 읽으면 나중에 감소한다.
+        const roomCursors = getReadCursors('room', String(roomId));
+        broadcastToRoomPerViewer(roomId, (viewer) => ({
+          ...payload,
+          unreadCount: countUnreadForMessage(
+            roomCursors, roomMembers, senderNickname, roomMsgId, viewer,
+          ),
+        }));
         // '내 채팅방' 목록의 마지막 메시지/시간 실시간 갱신용 (DB 재조회 없이 가볍게 반영)
         broadcastToRoom(roomId, {
           type: 'room_last_message', roomId,

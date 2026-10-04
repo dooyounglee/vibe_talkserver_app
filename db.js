@@ -280,17 +280,25 @@ function getLatestDmMessageId(nickname, withUser) {
 
 /**
  * 한 메시지를 아직 안 읽은 사람 수 (카톡의 '1' / '4' 숫자).
- * 발신자 자신은 세지 않고, participants(현재 대화 참여자) 중
- * 커서가 메시지 id 보다 작은 사람만 센다.
+ * 발신자 자신과 viewer(지금 이 화면을 보고 있는 사람)는 세지 않고,
+ * participants(현재 대화 참여자) 중 커서가 메시지 id 보다 작은 사람만 센다.
+ *
+ * viewer 를 빼는 이유 (카톡식 '안읽은 사람 수'):
+ *   3명 방에서 A가 보냈고 B가 읽었다면 →
+ *     - A 화면: 본인 메시지 옆 '1'  (C 만 남음)
+ *     - B 화면: A 의 메시지(message-other) 옆에도 '1'  (B 자신은 읽었으니 세지 않음)
+ *   viewer 를 세지 않으면 B 화면에서 B까지 집계되어 '2' 가 되고,
+ *   열람 중인데 숫자가 남아 있는 모순이 생긴다.
  */
-function countUnreadForMessage(cursors, participants, senderNickname, messageId) {
+function countUnreadForMessage(cursors, participants, senderNickname, messageId, viewerNickname) {
   const sender = String(senderNickname || '').trim();
+  const viewer = String(viewerNickname || '').trim();
   const id = Number(messageId) || 0;
   if (!id) return 0;
   let count = 0;
   for (const raw of Array.isArray(participants) ? participants : []) {
     const nick = String(raw || '').trim();
-    if (!nick || nick === sender) continue;
+    if (!nick || nick === sender || nick === viewer) continue;
     const readId = Number(cursors[nick]) || 0;
     if (readId < id) count += 1;
   }
@@ -301,12 +309,17 @@ function countUnreadForMessage(cursors, participants, senderNickname, messageId)
  * 메시지 배열에 안 읽은 사람 수(unreadCount)를 붙여 돌려준다.
  * messages 항목은 { id, nickname, text, timestamp } 형태여야 한다.
  *
+ * viewerNickname = 이 숫자를 받는 사람(히스토리를 요청한 본인).
+ *   숫자는 '지금 보는 사람'을 제외하고 계산해야 하므로 반드시 넘겨야 한다.
+ *   자기 메시지에는 viewer 가 곧 발신자라 기존 값(상대 미열람 수)과 같아지고,
+ *   상대 메시지에는 viewer 를 뺀 '남은 미열람 인원'이 된다.
+ *
  * NOTE: 클라이언트는 카톡식 숫자를 실시간으로 재계산하기 위해
  *   서버 messages.id 값을 'msgId' 필드로 읽는다 (useChatSocket.ts).
  *   여기서 'id'로만 내려주면 그 값이 undefined 가 되어
  *   숫자가 한 번에 사라지는 문제가 생기므로, 반드시 msgId 로 함께 내려준다.
  */
-function decorateUnreadCounts(scope, target, messages, participants) {
+function decorateUnreadCounts(scope, target, messages, participants, viewerNickname) {
   const list = Array.isArray(messages) ? messages : [];
   if (list.length === 0) return list;
   const cursors = getReadCursors(scope, target);
@@ -314,7 +327,9 @@ function decorateUnreadCounts(scope, target, messages, participants) {
     ...m,
     // 읽음 숫자 재계산용 id (클라이언트 계약 필드)
     msgId: Number(m.id) || 0,
-    unreadCount: countUnreadForMessage(cursors, participants, m.nickname, m.id),
+    unreadCount: countUnreadForMessage(
+      cursors, participants, m.nickname, m.id, viewerNickname,
+    ),
   }));
 }
 
