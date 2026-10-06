@@ -53,6 +53,33 @@ const clients = new Map();
 // 소켓별 입장 방 집합 (발송 스코프용 캐시, 권한 판정은 항상 DB 기준)
 const wsRooms = new Map();
 
+// ─── 내 상태 전파 (status_set): user_no → 상태 ───
+// 접속 중인 사용자의 기본값은 online. 드롭다운 변경(status_set)으로 바뀌고,
+// 접속 해제 시 offline으로 확정되며, 재접속(join) 시 다시 기본값 online이 된다.
+const statusOverrides = new Map();
+const MY_STATUSES = new Set(['online', 'offline', 'meeting', 'busy', 'away']);
+
+// user_no의 현재 상태: 직접 지정된 값이 있으면 그대로, 없으면 접속 여부로 online/offline 판단
+function statusOfUser(no) {
+  const n = Number(no);
+  const override = statusOverrides.get(n);
+  if (override) return override;
+  for (const v of clients.values()) {
+    if (Number(v) === n) return 'online';
+  }
+  return 'offline';
+}
+
+// 등록된 전체 사용자별 상태맵 (userlist에 userStatuses로 실어 보낸다)
+function buildUserStatuses() {
+  const statuses = {};
+  for (const u of getAllUsers()) {
+    const no = Number(u.user_no);
+    if (Number.isInteger(no) && no > 0) statuses[no] = statusOfUser(no);
+  }
+  return statuses;
+}
+
 function myUserNo(ws) {
   return toUserNo(clients.get(ws));
 }
@@ -129,8 +156,8 @@ function broadcastReadAck(scope, target) {
   });
 }
 
-// 등록된 전체 사용자 목록 + 현재 접속중 목록을 전체 클라이언트에게 전송
-// users: [{user_no, nickname}], onlineUsers: [user_no]
+// 등록된 전체 사용자 목록 + 현재 접속중 목록 + 사용자별 상태를 전체 클라이언트에게 전송
+// users: [{user_no, nickname}], onlineUsers: [user_no], userStatuses: {user_no: status}
 // admin 접속자에게는 탈퇴 포함 상세(usersDetail)도 개별 전송
 function broadcastUserList() {
   const onlineUsers = Array.from(clients.values()).map((v) => Number(v)).filter((n) => Number.isInteger(n));
@@ -139,6 +166,7 @@ function broadcastUserList() {
     type: "userlist",
     users,
     onlineUsers,
+    userStatuses: buildUserStatuses(),
   });
   // admin에게는 전체(탈퇴 포함) 상세 목록 추가 전송
   try {
@@ -184,6 +212,8 @@ wss.on('connection', (ws) => {
           return;
         }
         clients.set(ws, user.user_no);
+        // 재접속 시 상태 기본값은 online (이전 접속에서 남은 override 제거)
+        statusOverrides.delete(Number(user.user_no));
         console.log(`user_no=${user.user_no}(${user.nickname}) 입장`);
 
         trackClear(ws);
@@ -202,6 +232,16 @@ wss.on('connection', (ws) => {
 
         // 이후 브로드캐스트 — 입장 인사 + 사용자 목록 갱신
         broadcast({ type: 'system', text: `${user.nickname}님이 입장했습니다` });
+        broadcastUserList();
+      }
+
+      // ─── 내 상태 전파: 드롭다운에서 고른 상태를 전체에 알린다 ───
+      else if (data.type === 'status_set') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const status = String(data.status ?? '');
+        if (!MY_STATUSES.has(status)) return;
+        statusOverrides.set(me, status);
         broadcastUserList();
       }
 
@@ -659,6 +699,9 @@ wss.on('connection', (ws) => {
     const no = myUserNo(ws);
     if (no) {
       clients.delete(ws);
+      // 접속 해제 시 해당 사용자 상태를 offline으로 확정한다 (재접속 시 기본값은 online).
+      // clients에서 먼저 지운 뒤 확정해야 방송되는 onlineUsers/userStatuses가 모두 offline을 가리킨다.
+      statusOverrides.set(Number(no), 'offline');
       trackClear(ws);
       const left = getUserByNo(no);
       console.log(`user_no=${no} 연결 종료`);
