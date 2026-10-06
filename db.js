@@ -473,6 +473,39 @@ function addMember(roomId, userNo, timestamp) {
   ).run(roomId, no, timestamp);
 }
 
+// ─── 초대: 운영 중인 방에 멤버 추가 ───
+// 초대받은 멤버의 display_name에는 "전체 멤버 닉네임을 오름차순으로 이어 붙인 값"을 저장한다.
+// (초대받은 사람에게 적용될 채팅방 제목 기본값. 기존 멤버의 display_name은 건드리지 않는다)
+// 반환: { added: 이번에 새로 들어온 user_no[], memberNos: 초대 후 전체 멤버 user_no[] }
+function inviteMembers(roomId, userNos, timestamp) {
+  const rid = Number(roomId);
+  const ts = Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now();
+  const added = [];
+  if (!Number.isInteger(rid) || rid <= 0) return { added, memberNos: [] };
+  const seen = new Set();
+  let seq = 0;
+  for (const raw of Array.isArray(userNos) ? userNos : []) {
+    const no = toUserNo(raw);
+    if (!no || seen.has(no)) continue;
+    seen.add(no);
+    if (isMember(rid, no)) continue; // 이미 멤버 → 중복 초대 제외
+    addMember(rid, no, ts + seq); // joined_at = 초대 시점 (이후 메시지만 보는 기준점)
+    seq += 1;
+    added.push(no);
+  }
+  if (added.length > 0) {
+    // 전체 멤버 닉네임 나열값을 "초대받은 멤버"의 제목 기본값으로만 저장한다.
+    const nicks = getRoomMembers(rid).map((m) => m.nickname);
+    const title = joinMemberNames('', nicks); // 빈 값/중복 제거 + localeCompare 오름차순 연결
+    for (const no of added) {
+      db.prepare(
+        `UPDATE room_members SET display_name = ? WHERE room_id = ? AND user_no = ?`
+      ).run(title, rid, no);
+    }
+  }
+  return { added, memberNos: getRoomMemberNos(rid) };
+}
+
 // 사용자별 방 제목 조회 (없으면 NULL → 호출자가 rooms.name 폴백)
 function getRoomDisplayName(roomId, userNo) {
   try {
@@ -639,15 +672,28 @@ function getRoomHistory(roomId, limit = 50) {
 }
 
 // 채팅창 열람용: 방 최근 N건 (기본 10건, 오래된 → 최신 순)
-function getRecentRoomMessages(roomId, limit = 10) {
-  const rows = db
-    .prepare(
-      `SELECT id, sender_no, sender_name, text, timestamp FROM messages
-       WHERE room_type = 'room' AND room_id = ?
-       ORDER BY timestamp DESC, id DESC
-       LIMIT ?`
-    )
-    .all(roomId, limit);
+// viewerNo를 주면 "초대받은 시점(room_members.joined_at) 이후"의 메시지만 돌려준다.
+// 두 컬럼 모두 epoch ms라 비교를 그대로 쓸 수 있다. (초대받은 사람은 그 이전 대화를 볼 수 없다)
+function getRecentRoomMessages(roomId, limit = 10, viewerNo = null) {
+  const viewer = toUserNo(viewerNo);
+  const rows = viewer
+    ? db
+        .prepare(
+          `SELECT id, sender_no, sender_name, text, timestamp FROM messages
+           WHERE room_type = 'room' AND room_id = ?
+             AND timestamp >= (SELECT joined_at FROM room_members WHERE room_id = ? AND user_no = ?)
+           ORDER BY timestamp DESC, id DESC
+           LIMIT ?`
+        )
+        .all(roomId, roomId, viewer, limit)
+    : db
+        .prepare(
+          `SELECT id, sender_no, sender_name, text, timestamp FROM messages
+           WHERE room_type = 'room' AND room_id = ?
+           ORDER BY timestamp DESC, id DESC
+           LIMIT ?`
+        )
+        .all(roomId, limit);
   return rows.reverse().map((row) => ({
     id: Number(row.id),
     user_no: Number(row.sender_no),
@@ -822,6 +868,7 @@ module.exports = {
   findActiveOneToOneRoom,
   ensureOneToOneRoom,
   addMember,
+  inviteMembers,
   removeMember,
   countMembers,
   getRoomMembers,

@@ -11,6 +11,7 @@ const {
   isMember,
   ensureOneToOneRoom,
   addMember,
+  inviteMembers,
   removeMember,
   getRoomMembers,
   getRoomMemberNos,
@@ -387,7 +388,7 @@ wss.on('connection', (ws) => {
           messages: decorateUnreadCounts(
             'room',
             String(roomId),
-            getRecentRoomMessages(roomId, 10),
+            getRecentRoomMessages(roomId, 10, me),
             getRoomMemberNos(roomId),
           ),
         }));
@@ -454,6 +455,78 @@ wss.on('connection', (ws) => {
           });
         }
       }
+      // ─── 번호방: 초대 (운영 중인 방에 멤버 추가) ───
+      // 초대자는 반드시 방 멤버여야 하고, 대상은 등록된(탈퇴 아닌) 사용자만 가능하다.
+      // db.inviteMembers()가 멤버 추가 + 초대받은 멤버의 display_name(닉네임 나열 제목)을 저장한다.
+      // 초대받은 사람이 오프라인이어도 DB만 갱신되면 재접속 시 my_rooms로 노출된다.
+      else if (data.type === 'room_invite') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const roomId = Number(data.roomId);
+        if (!Number.isInteger(roomId)) return;
+        const room = getRoom(roomId);
+        const failInvite = (reason) => {
+          ws.send(JSON.stringify({ type: 'room_invite_failed', roomId, reason }));
+        };
+        if (!room || room.is_deleted === 1 || room.is_closed === 1) {
+          failInvite('not_found');
+          return;
+        }
+        if (!isMember(roomId, me)) {
+          failInvite('not_member');
+          return;
+        }
+        const rawMembers = Array.isArray(data.memberNos)
+          ? data.memberNos
+          : Array.isArray(data.members) ? data.members : [];
+        const memberNos = [];
+        for (const raw of rawMembers) {
+          const no = toUserNo(typeof raw === 'object' && raw !== null ? raw.user_no ?? raw.userNo : raw);
+          if (!no || no === me || memberNos.includes(no)) continue;
+          if (!isRegisteredNo(no)) continue;   // 미등록/탈퇴자는 초대 대상에서 제외
+          if (isMember(roomId, no)) continue;  // 이미 멤버는 중복 초대 제외
+          memberNos.push(no);
+          if (memberNos.length >= 50) break;
+        }
+        if (memberNos.length === 0) {
+          failInvite('no_targets');
+          return;
+        }
+        const { added } = inviteMembers(roomId, memberNos, Date.now());
+        console.log(`방 #${roomId} 초대 by user_no=${me} → [${added.join(', ')}]`);
+
+        // 방 멤버 전체(초대자 포함): 갱신된 내 방 목록 + 멤버 목록 전달
+        const roomMemberNos = getRoomMemberNos(roomId);
+        const memberProfiles = getRoomMembers(roomId);
+        wss.clients.forEach((client) => {
+          if (client.readyState !== WebSocket.OPEN) return;
+          const no = myUserNo(client);
+          if (!no) return;
+          if (roomMemberNos.includes(no)) {
+            client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(no) }));
+            client.send(JSON.stringify({
+              type: 'room_members', roomId, members: roomMemberNos, memberProfiles,
+            }));
+          }
+          // 초대받은 사람: 초대 시점 이후의 메시지만 담긴 히스토리로 덮어쓴다 (요구사항 6)
+          if (added.includes(no)) {
+            trackJoin(client, roomId);
+            client.send(JSON.stringify({
+              type: 'history_room',
+              roomId,
+              members: roomMemberNos,
+              memberProfiles,
+              messages: decorateUnreadCounts(
+                'room',
+                String(roomId),
+                getRecentRoomMessages(roomId, 10, no),
+                roomMemberNos,
+              ),
+            }));
+          }
+        });
+      }
+
       // ─── 번호방: 입장 ───
       else if (data.type === 'room_join') {
         const me = myUserNo(ws);
@@ -491,7 +564,7 @@ wss.on('connection', (ws) => {
           messages: decorateUnreadCounts(
             'room',
             String(roomId),
-            getRecentRoomMessages(roomId, 10),
+            getRecentRoomMessages(roomId, 10, me),
             getRoomMemberNos(roomId),
           ),
         }));
