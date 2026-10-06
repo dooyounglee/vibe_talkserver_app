@@ -1,7 +1,7 @@
 // WebSocket 채팅 서버 생성
 const WebSocket = require('ws');
 
-// SQLite 데이터베이스 (메시지/방 저장/조회)
+// SQLite 데이터베이스 (메시지/방 저장/조회) — user_no PK + login_id 체제
 const {
   saveMessage,
   createRoom,
@@ -13,6 +13,7 @@ const {
   addMember,
   removeMember,
   getRoomMembers,
+  getRoomMemberNos,
   getEarliestMemberExcept,
   transferOwner,
   getMyRooms,
@@ -21,10 +22,12 @@ const {
   closeRoomIfEmpty,
   getRoomHistory,
   getRecentRoomMessages,
+  getUserByNo,
+  getUserByLoginId,
   upsertUser,
-  withdrawUser,
-  isWithdrawn,
-  isRegistered,
+  renameUser,
+  isWithdrawnByNo,
+  isRegisteredNo,
   getAllUsers,
   getAllUsersDetail,
   bumpUnread,
@@ -37,16 +40,26 @@ const {
   getLatestRoomMessageId,
   countUnreadForMessage,
   decorateUnreadCounts,
+  isAdminNo,
+  toUserNo,
 } = require('./db');
 
 // 포트 8080에서 서버 실행 (테스트 시 PORT로 재지정 가능)
 const PORT = Number(process.env.PORT) || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-// 클라이언트별 닉네임 저장 (WebSocket 인스턴스 -> 닉네임)
+// 클라이언트별 user_no 저장 (WebSocket 인스턴스 -> user_no)
 const clients = new Map();
 // 소켓별 입장 방 집합 (발송 스코프용 캐시, 권한 판정은 항상 DB 기준)
 const wsRooms = new Map();
+
+function myUserNo(ws) {
+  return toUserNo(clients.get(ws));
+}
+function myProfile(ws) {
+  const no = myUserNo(ws);
+  return no ? getUserByNo(no) : null;
+}
 
 function trackJoin(ws, roomId) {
   if (!wsRooms.has(ws)) wsRooms.set(ws, new Set());
@@ -76,19 +89,19 @@ function broadcastToRoom(roomId, message) {
   const payload = JSON.stringify(message);
   wss.clients.forEach(client => {
     if (client.readyState !== WebSocket.OPEN) return;
-    const nick = clients.get(client);
-    if (!nick) return;
-    if (!isMember(roomId, nick)) return;
+    const no = myUserNo(client);
+    if (!no) return;
+    if (!isMember(roomId, no)) return;
     trackJoin(client, roomId);
     client.send(payload);
   });
 }
 
-/** read_ack 에 실어 보낼 참여자 목록 (room = 방 멤버) */
+/** read_ack 에 실어 보낼 참여자 목록 (room = 방 멤버 user_no) */
 function readAckParticipants(scope, target) {
   const roomId = Number(target);
   if (!Number.isInteger(roomId)) return [];
-  return getRoomMembers(roomId);
+  return getRoomMemberNos(roomId);
 }
 
 // ─── 읽음 변경 알림 (카톡의 '1' 숫자가 실시간으로 줄어드는 동작) ───
@@ -110,17 +123,17 @@ function broadcastReadAck(scope, target) {
   if (!Number.isInteger(roomId)) return;
   wss.clients.forEach(client => {
     if (client.readyState !== WebSocket.OPEN) return;
-    const nick = clients.get(client);
-    if (!nick || !isMember(roomId, nick)) return;
+    const no = myUserNo(client);
+    if (!no || !isMember(roomId, no)) return;
     client.send(payload);
   });
 }
 
 // 등록된 전체 사용자 목록 + 현재 접속중 목록을 전체 클라이언트에게 전송
-// users: DB 등록 사용자 전체 (탈퇴 제외), onlineUsers: 현재 접속중
+// users: [{user_no, nickname}], onlineUsers: [user_no]
 // admin 접속자에게는 탈퇴 포함 상세(usersDetail)도 개별 전송
 function broadcastUserList() {
-  const onlineUsers = Array.from(clients.values());
+  const onlineUsers = Array.from(clients.values()).map((v) => Number(v)).filter((n) => Number.isInteger(n));
   const users = getAllUsers();
   broadcast({
     type: "userlist",
@@ -132,7 +145,7 @@ function broadcastUserList() {
     const detail = getAllUsersDetail();
     wss.clients.forEach((client) => {
       if (client.readyState !== WebSocket.OPEN) return;
-      if (clients.get(client) !== 'admin') return;
+      if (!isAdminNo(myUserNo(client))) return;
       client.send(JSON.stringify({ type: 'userlist_detail', usersDetail: detail }));
     });
   } catch (e) {
@@ -154,109 +167,134 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message.toString());
       
-      // JOIN 메시지 처리: 닉네임 설정 및 입장 알림
-      // NOTE: 접속 시 자동 upsert 제거 — 등록된 사용자만 입장 가능 (admin이 사전 등록)
+      // JOIN 메시지 처리: login_id로 입장, 내부는 user_no, 화면은 nickname
       if (data.type === 'join') {
-        const nickname = String(data.nickname || '').trim();
-        if (!nickname) return;
-        // 미등록/탈퇴 사용자는 입장 거부
-        if (isWithdrawn(nickname)) {
-          ws.send(JSON.stringify({ type: 'join_failed', reason: 'withdrawn', text: `${nickname}님은 탈퇴한 사용자입니다` }));
+        const loginId = String(data.loginId ?? data.login_id ?? data.id ?? '').trim();
+        if (!loginId) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'empty', text: '아이디를 입력하세요.' }));
           return;
         }
-        if (!isRegistered(nickname)) {
-          ws.send(JSON.stringify({ type: 'join_failed', reason: 'not_registered', text: `${nickname}님은 등록된 사용자가 아닙니다. 관리자에게 문의하세요` }));
+        const user = getUserByLoginId(loginId);
+        if (!user) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'not_registered', text: '등록된 사용자가 아닙니다. 관리자에게 문의하세요' }));
           return;
         }
-        clients.set(ws, nickname);
-        console.log(`${nickname} 닉네임으로 입장`);
+        if (user.isDeleted) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'withdrawn', text: '탈퇴한 사용자입니다' }));
+          return;
+        }
+        clients.set(ws, user.user_no);
+        console.log(`user_no=${user.user_no}(${user.nickname}) 입장`);
 
-        // 이 소켓이 속한 방 캐시 복원 (재접속 시 내방 복원용, 멤버십은 DB 유지)
         trackClear(ws);
-        const myRooms = getMyRooms(nickname);
+        const myRooms = getMyRooms(user.user_no);
         for (const r of myRooms) trackJoin(ws, r.roomId);
 
-        // 모든 클라이언트에게 입장 알림
-        broadcast({
-          type: 'system',
-          text: `${nickname}님이 입장했습니다`
-        });
-
-        // 사용자 목록 업데이트 및 전송
+        broadcast({ type: 'system', text: `${user.nickname}님이 입장했습니다` });
         broadcastUserList();
-
-        // 내 방 목록 전송 (삭제/폐쇄 제외)
+        // join_ok에 표시용 닉네임 포함 — 클라는 user_no를 키로, nickname을 표시로 쓴다
+        ws.send(JSON.stringify({ type: 'join_ok', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
-
-        // 안읽은 건수 복원 (서버 DB 기준 — 다른 PC에서 로그인해도 그대로 유지된다)
-        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(nickname) }));
-
-        // NOTE: 접속 시 전체 방/DM 히스토리 일괄 푸시 제거.
-        // 채팅창이 열릴 때마다(room_history / dm_history 요청) DB에서 최근 10건을 조회해 준다.
-
-        // admin 접속 시 관리용 전체 목록(탈퇴 포함)도 전송
-        if (nickname === 'admin') {
+        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(user.user_no) }));
+        if (isAdminNo(user.user_no)) {
           ws.send(JSON.stringify({ type: 'userlist_detail', usersDetail: getAllUsersDetail() }));
         }
       }
 
-      // ─── 사용자 관리: 추가/수정 (admin 전용) ───
-      // nickname + 탈퇴여부(isDeleted)를 입력받아 upsert
+      // ─── 사용자 관리: 추가/수정 (admin=user_no 1 전용) ───
+      // login_id(불변) + nickname + phone + user_name + 탈퇴여부
       else if (data.type === 'user_upsert') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
-        if (senderNickname !== 'admin') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        if (!isAdminNo(me)) {
           ws.send(JSON.stringify({ type: 'system', text: '사용자 관리는 admin만 할 수 있습니다.' }));
           return;
         }
-        const nickname = String(data.nickname || '').trim().slice(0, 20);
-        if (!nickname) {
-          ws.send(JSON.stringify({ type: 'user_upsert_result', ok: false, reason: 'empty', text: '닉네임을 입력하세요.' }));
+        const result = upsertUser({
+          loginId: data.loginId ?? data.login_id ?? data.id,
+          nickname: data.nickname,
+          phone: data.phone ?? null,
+          userName: data.userName ?? data.user_name ?? null,
+          timestamp: Date.now(),
+          isDeleted: data.isDeleted === true || data.is_deleted === 1 || data.isDeleted === 1,
+        });
+        if (!result.ok) {
+          const texts = {
+            invalid_login_id: '아이디는 영문+숫자, 최대 20자입니다.',
+            invalid_nickname: '닉네임을 입력하세요. (최대 20자)',
+            login_id_taken: '이미 사용 중인 아이디입니다. (탈퇴 포함)',
+            nickname_taken: '이미 사용 중인 닉네임입니다. (탈퇴 포함)',
+            admin_protected: 'admin은 변경할 수 없습니다.',
+          };
+          ws.send(JSON.stringify({ type: 'user_upsert_result', ok: false, reason: result.reason, text: texts[result.reason] || '사용자 저장에 실패했습니다' }));
           return;
         }
-        const isDeleted = data.isDeleted === true || data.is_deleted === 1 || data.isDeleted === 1;
-        upsertUser(nickname, Date.now(), isDeleted);
-        console.log(`사용자 upsert by admin: ${nickname} (탈퇴=${isDeleted ? 'Y' : 'N'})`);
-        ws.send(JSON.stringify({ type: 'user_upsert_result', ok: true, nickname, isDeleted }));
+        ws.send(JSON.stringify({ type: 'user_upsert_result', ok: true, user_no: result.user_no }));
         broadcastUserList();
+      }
+
+      // ─── 닉네임 변경 (본인 + admin) ───
+      else if (data.type === 'user_rename') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const result = renameUser({
+          targetNo: data.targetUserNo ?? data.user_no ?? data.targetNo ?? me,
+          newNickname: data.newNickname ?? data.nickname,
+          requesterNo: me,
+        });
+        if (!result.ok) {
+          const texts = {
+            invalid_user: '대상 사용자가 올바르지 않습니다.',
+            invalid_nickname: '닉네임을 입력하세요. (최대 20자)',
+            forbidden: '본인의 닉네임만 변경할 수 있습니다.',
+            admin_protected: 'admin 닉네임은 변경할 수 없습니다.',
+            not_found: '사용자를 찾을 수 없습니다.',
+            nickname_taken: '이미 사용 중인 닉네임입니다. (탈퇴 포함)',
+          };
+          ws.send(JSON.stringify({ type: 'user_rename_result', ok: false, reason: result.reason, text: texts[result.reason] || '닉네임 변경에 실패했습니다' }));
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'user_rename_result', ok: true, user_no: result.user_no }));
+        broadcastUserList();
+        // 본인 표시 갱신용
+        const updated = getUserByNo(result.user_no);
+        for (const [client, no] of clients.entries()) {
+          if (Number(no) !== Number(result.user_no)) continue;
+          if (client.readyState !== WebSocket.OPEN) continue;
+          client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname }));
+          client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(updated.user_no) }));
+        }
       }
       
       // ─── 1:1 대화방 확보: '사용자' 탭에서 상대를 눌러 1:1 창을 열 때 ───
       // 1:1은 "멤버 2명 방" 하나로만 표현한다(별도 DM 개념 없음).
-      // 이미 있는 방이면 번호를 그대로, 없으면 새로 만들어 돌려준다.
-      // 방은 처음 열 때 만들어지며, 메시지 0개인 1:1방은 목록에서 숨겨지므로
-      // 사용자에게 "빈 방"이 보이지 않는다.
+      // 신 규격: { withUserNo } — user_no 기준
       else if (data.type === 'dm_room_open') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
+        const my = getUserByNo(me);
+        if (!my || my.isDeleted) return;
 
-        const targetNickname = String(data.withUser || '').trim();
-        if (!targetNickname || targetNickname === senderNickname) return;
-        // 탈퇴한 사용자와는 대화 불가
-        if (isWithdrawn(senderNickname) || isWithdrawn(targetNickname)) {
+        const peerNo = toUserNo(data.withUserNo ?? data.with_no ?? data.peerNo ?? data.peer_no ?? data.withUser ?? data.with);
+        if (!peerNo || peerNo === me) return;
+        const peer = getUserByNo(peerNo);
+        if (!peer || peer.isDeleted) {
           ws.send(JSON.stringify({
             type: "system",
-            text: `탈퇴한 사용자와는 대화할 수 없습니다`,
-          }));
-          return;
-        }
-        // 수신자가 등록된 사용자가 아니면 차단
-        if (!isRegistered(targetNickname)) {
-          ws.send(JSON.stringify({
-            type: "system",
-            text: `${targetNickname}님은 등록된 사용자가 아닙니다`,
+            text: `대화 상대가 유효하지 않습니다`,
           }));
           return;
         }
 
         let roomId = null;
         try {
-          // Node 이벤트루프 동기 구간에서 check→insert를 연속 수행해
-          // 양쪽 동시 클릭에 의한 중복방 생성을 1차 방지한다.
-          roomId = ensureOneToOneRoom(senderNickname, targetNickname, Date.now());
+          roomId = ensureOneToOneRoom(me, peerNo, Date.now(), {
+            [String(me)]: my.nickname,
+            [String(peerNo)]: peer.nickname,
+          });
           if (roomId) {
             trackJoin(ws, roomId);
-            console.log(`1:1방 #${roomId} 확보 (${senderNickname} ↔ ${targetNickname})`);
+            console.log(`1:1방 #${roomId} 확보 (user_no ${me} ↔ ${peerNo})`);
           }
         } catch (e) {
           console.error('1:1방 확보 실패:', e);
@@ -268,13 +306,13 @@ wss.on('connection', (ws) => {
         }
 
         // 요청한 사람에게 방 번호를 돌려준다 (클라이언트가 이 창을 연다)
-        ws.send(JSON.stringify({ type: 'room_opened', withUser: targetNickname, roomId }));
+        ws.send(JSON.stringify({ type: 'room_opened', withUserNo: peerNo, withUser: peer.nickname, roomId }));
         // 양쪽 방 목록을 최신으로 맞춘다 (새로 만들어졌을 수 있으므로 상대도 갱신)
-        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
-        for (const [client, nick] of clients.entries()) {
-          if (nick !== targetNickname) continue;
+        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
+        for (const [client, no] of clients.entries()) {
+          if (Number(no) !== peerNo) continue;
           if (client.readyState !== WebSocket.OPEN) continue;
-          client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(nick) }));
+          client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(no) }));
           break;
         }
       }
@@ -287,86 +325,97 @@ wss.on('connection', (ws) => {
 
       // ─── 채팅창 열람: 번호방 최근 10건 조회 (창이 열릴 때마다 요청) ───
       else if (data.type === 'room_history') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
         const room = getRoom(roomId);
         // 존재하지 않는 방/멤버가 아닌 방은 빈 히스토리로 응답 (누출 방지)
-        if (!room || !isMember(roomId, senderNickname)) {
+        if (!room || !isMember(roomId, me)) {
           ws.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
           return;
         }
         ws.send(JSON.stringify({
           type: 'history_room',
           roomId,
-          // members 를 같이 보내 방을 연 클라이언트가 즉시 참여자 목록을 갖게 한다.
-          // (이 목록이 없으면 이후 read_ack 로 숫자를 재계산할 때 0으로 잘못 계산된다)
-          members: getRoomMembers(roomId),
+          members: getRoomMemberNos(roomId),
+          memberProfiles: getRoomMembers(roomId),
           messages: decorateUnreadCounts(
             'room',
             String(roomId),
             getRecentRoomMessages(roomId, 10),
-            getRoomMembers(roomId),
+            getRoomMemberNos(roomId),
           ),
         }));
       }
 
       // ─── 번호방: 생성 (초대 멤버 포함 가능) ───
+      // 신 규격: { memberNos: number[] } — user_no 기준
       else if (data.type === 'room_create') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
-        // 초대생성: members 배열(닉네임 목록)을 함께 받아 방 생성 시 멤버로 등록
-        // 탈퇴한 사용자는 초대 대상에서 제외
-        const rawMembers = Array.isArray(data.members) ? data.members : [];
-        const members = rawMembers
-          .map((m) => String(m || '').trim())
-          .filter((m) => m && m !== senderNickname && !isWithdrawn(m))
-          .slice(0, 50);
-        // 방 이름은 직접 입력받지 않는다(클라이언트 input 제거).
-        // 실제 멤버(탈퇴자·중복 제외) 기준으로 "이름 오름차순 쉼표 연결"을 만들어
-        // rooms.name과 room_members.display_name에 동일하게 넣는다.
-        // 구버전 클라이언트가 이름을 보내는 경우에만 그 값을 폴백으로 쓴다.
+        const me = myUserNo(ws);
+        if (!me) return;
+        const my = getUserByNo(me);
+        if (!my) return;
+        const rawMembers = Array.isArray(data.memberNos)
+          ? data.memberNos
+          : Array.isArray(data.members) ? data.members : [];
+        const memberNos = [];
+        for (const raw of rawMembers) {
+          const no = toUserNo(typeof raw === 'object' && raw !== null ? raw.user_no ?? raw.userNo : raw);
+          if (!no || no === me || memberNos.includes(no)) continue;
+          if (!isRegisteredNo(no)) continue;
+          memberNos.push(no);
+          if (memberNos.length >= 50) break;
+        }
+        // 방 이름은 직접 입력받지 않는다. 실제 멤버 기준 스냅샷으로 생성.
         const legacyName = String(data.name || '').trim().slice(0, 30);
-        const name = joinMemberNames(senderNickname, members) || legacyName;
+        const nickMap = {};
+        for (const u of getAllUsersDetail()) nickMap[String(u.user_no)] = u.nickname;
+        const ownerNick = my.nickname;
+        const invitedNicks = memberNos.map((no) => nickMap[String(no)] || '');
+        const name = joinMemberNames(ownerNick, invitedNicks) || legacyName;
         if (!name) {
           ws.send(JSON.stringify({ type: 'system', text: '방을 만들지 못했습니다.' }));
           return;
         }
         const now = Date.now();
-        const roomId = createRoom({ name, owner: senderNickname, timestamp: now, members });
+        const roomId = createRoom({
+          name, ownerNo: me, timestamp: now, memberNos,
+          ownerNickname: ownerNick, memberNicknames: nickMap,
+        });
         trackJoin(ws, roomId);
-        console.log(`방 생성 #${roomId} "${name}" by ${senderNickname} (초대 ${members.length}명)`);
+        console.log(`방 생성 #${roomId} "${name}" by user_no=${me} (초대 ${memberNos.length}명)`);
         ws.send(JSON.stringify({
           type: 'room_created',
           roomId,
-          rooms: getMyRooms(senderNickname),
+          rooms: getMyRooms(me),
         }));
         ws.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
         broadcastToRoom(roomId, {
-          type: 'room_members', roomId, members: getRoomMembers(roomId),
+          type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
         });
         // 초대받은 온라인 멤버에게 내 방 목록 + 빈 히스토리 즉시 푸시
-        // (다음 join/재접속 때까지 기다리지 않고 바로 목록에 뜨게 함)
-        if (members.length > 0) {
+        if (memberNos.length > 0) {
           wss.clients.forEach((client) => {
             if (client === ws) return;
             if (client.readyState !== WebSocket.OPEN) return;
-            const nick = clients.get(client);
-            if (!nick || !members.includes(nick)) return;
+            const no = myUserNo(client);
+            if (!no || !memberNos.includes(no)) return;
             trackJoin(client, roomId);
-            client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(nick) }));
+            client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(no) }));
             client.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
             client.send(JSON.stringify({
-              type: 'room_members', roomId, members: getRoomMembers(roomId),
+              type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
             }));
           });
         }
       }
       // ─── 번호방: 입장 ───
       else if (data.type === 'room_join') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
+        const my = getUserByNo(me);
+        if (!my) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
         const room = getRoom(roomId);
@@ -382,30 +431,29 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'room_join_failed', roomId, reason: 'closed' }));
           return;
         }
-        if (!isMember(roomId, senderNickname)) {
-          addMember(roomId, senderNickname, Date.now());
+        if (!isMember(roomId, me)) {
+          addMember(roomId, me, Date.now());
           broadcastToRoom(roomId, {
             type: 'system', roomId,
-            text: `${senderNickname}님이 #${roomId} 방에 입장했습니다`,
+            text: `${my.nickname}님이 #${roomId} 방에 입장했습니다`,
           });
         }
         trackJoin(ws, roomId);
         ws.send(JSON.stringify({
           type: 'history_room',
           roomId,
-          // members 를 같이 보내 방을 연 클라이언트가 즉시 참여자 목록을 갖게 한다.
-          // (이 목록이 없으면 이후 read_ack 로 숫자를 재계산할 때 0으로 잘못 계산된다)
-          members: getRoomMembers(roomId),
+          members: getRoomMemberNos(roomId),
+          memberProfiles: getRoomMembers(roomId),
           messages: decorateUnreadCounts(
             'room',
             String(roomId),
             getRecentRoomMessages(roomId, 10),
-            getRoomMembers(roomId),
+            getRoomMemberNos(roomId),
           ),
         }));
-        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
+        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
         broadcastToRoom(roomId, {
-          type: 'room_members', roomId, members: getRoomMembers(roomId),
+          type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
         });
       }
       // ─── 번호방: 방제목 수정 (사용자별 — 고친 사람에게만 적용) ───
@@ -413,8 +461,8 @@ wss.on('connection', (ws) => {
       // 멤버는 그대로 본다. 서버도 "요청한 본인 행"만 고치게 하여 1:1방/단체방 모두
       // 별도 구분 없이 같은 방식으로 동작한다.
       else if (data.type === 'room_rename') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
         const title = String(data.title || '').trim();
@@ -432,140 +480,137 @@ wss.on('connection', (ws) => {
           return;
         }
         // 멤버만 수정 가능 (권한 판정은 DB 기준)
-        if (!isMember(roomId, senderNickname)) {
+        if (!isMember(roomId, me)) {
           ws.send(JSON.stringify({
             type: 'room_rename_failed', roomId, reason: 'not_member',
           }));
           return;
         }
-        const ok = setRoomDisplayName(roomId, senderNickname, title);
+        const ok = setRoomDisplayName(roomId, me, title);
         if (!ok) {
           ws.send(JSON.stringify({
             type: 'room_rename_failed', roomId, reason: 'update_failed',
           }));
           return;
         }
-        console.log(`방 #${roomId} 제목 변경 by ${senderNickname} → "${title}"`);
-        // 수정한 본인에게만 새 목록을 내려준다 (다른 멤버 제목은 그대로여서 무의미).
-        // 같은 닉네임의 다른 소켓(같은 PC의 여러 탭 등)도 함께 갱신한다.
+        console.log(`방 #${roomId} 제목 변경 by user_no=${me} → "${title}"`);
         wss.clients.forEach((client) => {
-          if (clients.get(client) !== senderNickname) return;
+          if (Number(myUserNo(client)) !== me) return;
           if (client.readyState !== WebSocket.OPEN) return;
-          client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
+          client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
         });
       }
 
       // ─── 번호방: 나가기 (잔류자 유지, 마지막 퇴장 시 폐쇄) ───
       else if (data.type === 'room_leave') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
+        const my = getUserByNo(me);
+        if (!my) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
         const room = getRoom(roomId);
-        if (!room || !isMember(roomId, senderNickname)) return;
-        const wasOwner = room.owner === senderNickname;
-        removeMember(roomId, senderNickname);
+        if (!room || !isMember(roomId, me)) return;
+        const wasOwner = Number(room.owner_no) === me;
+        removeMember(roomId, me);
         trackLeave(ws, roomId);
-        // 나간 방의 안읽은 건수는 의미가 없으므로 정리한다.
-        // (다시 입장하면 0부터 다시 쌓인다)
-        clearUnreadForRoom(senderNickname, roomId, Date.now());
+        clearUnreadForRoom(me, roomId, Date.now());
+        clearReadCursor(me, 'room', String(roomId), Date.now());
         if (wasOwner) {
-          const next = getEarliestMemberExcept(roomId, senderNickname);
+          const next = getEarliestMemberExcept(roomId, me);
           if (next) transferOwner(roomId, next);
         }
         const closed = closeRoomIfEmpty(roomId, Date.now());
         if (closed) {
           ws.send(JSON.stringify({ type: 'room_closed', roomId, reason: 'closed' }));
-          ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
+          ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
           return;
         }
         broadcastToRoom(roomId, {
           type: 'system', roomId,
-          text: `${senderNickname}님이 #${roomId} 방에서 나갔습니다`,
+          text: `${my.nickname}님이 #${roomId} 방에서 나갔습니다`,
         });
         broadcastToRoom(roomId, {
-          type: 'room_members', roomId, members: getRoomMembers(roomId),
+          type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
         });
-        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
+        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
       }
 
       // ─── 번호방: 삭제 (방장만, soft delete — DB 보존) ───
       else if (data.type === 'room_delete') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
         const room = getRoom(roomId);
         if (!room) return;
         if (room.is_deleted === 1) return;
-        if (room.owner !== senderNickname) {
+        if (Number(room.owner_no) !== me) {
           ws.send(JSON.stringify({ type: 'system', text: `방 #${roomId} 삭제는 방장만 할 수 있습니다.` }));
           return;
         }
-        softDeleteRoom(roomId, senderNickname, Date.now());
-        console.log(`방 #${roomId} 삭제 by ${senderNickname} (DB 보존)`);
+        softDeleteRoom(roomId, me, Date.now());
+        console.log(`방 #${roomId} 삭제 by user_no=${me} (DB 보존)`);
         wss.clients.forEach((client) => {
-          const nick = clients.get(client);
-          if (!nick || !isMember(roomId, nick)) return;
+          const no = myUserNo(client);
+          if (!no || !isMember(roomId, no)) return;
           trackLeave(client, roomId);
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({ type: 'room_closed', roomId, reason: 'deleted' }));
-            client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(nick) }));
+            client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(no) }));
           }
         });
       }
 
       // ─── 번호방: 메시지 (멤버 + 활성방만) ───
       else if (data.type === 'room_message') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
+        const my = getUserByNo(me);
+        if (!my) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
         const text = String(data.text || '').trim();
         if (!text) return;
         const room = getRoom(roomId);
         if (!isRoomActive(room)) return;
-        if (!isMember(roomId, senderNickname)) return;
+        if (!isMember(roomId, me)) return;
         const timestamp = Date.now();
-        const roomMembers = getRoomMembers(roomId);
+        const roomMemberNos = getRoomMemberNos(roomId);
         const payload = {
           type: 'room_message', roomId,
-          from: senderNickname, text: text.slice(0, 2000), timestamp,
+          from_no: me, from: my.nickname, text: text.slice(0, 2000), timestamp,
         };
-        console.log(`#${roomId} ${senderNickname}: ${text}`);
+        console.log(`#${roomId} user_no=${me}(${my.nickname}): ${text}`);
         const savedRoom = saveMessage({
-          roomType: 'room', sender: senderNickname, receiver: null,
+          roomType: 'room', senderNo: me, senderName: my.nickname,
           text: payload.text, timestamp, roomId,
         });
         // 저장된 행 id + 읽지 않은 멤버 수를 붙인다.
         // 발신자 본인 화면에서 카톡식 숫자로 표시되고, 상대가 읽으면 나중에 감소한다.
         const roomMsgId = Number(savedRoom?.lastInsertRowid || 0);
         payload.msgId = roomMsgId;
-        // 발신자 본인 화면에서 카톡식 숫자로 표시되고, 상대가 읽으면 나중에 감소한다.
-        // blur 상태인 수신자는 커서가 뒤처져 그대로 집계되고, focus 하면 0 이 된다.
         payload.unreadCount = countUnreadForMessage(
           getReadCursors('room', String(roomId)),
-          roomMembers,
-          senderNickname,
+          roomMemberNos,
+          me,
           roomMsgId,
         );
         broadcastToRoom(roomId, payload);
         // '내 채팅방' 목록의 마지막 메시지/시간 실시간 갱신용 (DB 재조회 없이 가볍게 반영)
         broadcastToRoom(roomId, {
           type: 'room_last_message', roomId,
-          from: senderNickname, text: payload.text, timestamp,
+          from_no: me, from: my.nickname, text: payload.text, timestamp,
         });
 
         // 방 멤버(발신자 제외) 안읽은 건수 +1.
-        // 온라인 멤버에게는 갱신 신호를 보내 배지가 바로 반영되게 하고,
-        // 오프라인 멤버는 DB에 누적되었다가 다음 접속 시 복원된다.
-        for (const member of roomMembers) {
-          if (member === senderNickname) continue;
-          bumpUnread(member, 'room', String(roomId), timestamp);
+        for (const memberNo of roomMemberNos) {
+          if (memberNo === me) continue;
+          bumpUnread(memberNo, 'room', String(roomId), timestamp);
         }
-        for (const [client, nick] of clients.entries()) {
-          if (nick === senderNickname) continue;
-          if (!isMember(roomId, nick)) continue;
+        for (const [client, no] of clients.entries()) {
+          if (Number(no) === me) continue;
+          if (!isMember(roomId, no)) continue;
           if (client.readyState !== WebSocket.OPEN) continue;
           client.send(JSON.stringify({
             type: 'unread_bump', scope: 'room', target: String(roomId),
@@ -574,37 +619,31 @@ wss.on('connection', (ws) => {
       }
 
       // ─── 안읽은 건수: 읽음 처리 ───
-      // 채팅창을 열거나 메시지를 읽으면 클라이언트가 이 신호를 보낸다.
-      // 서버 DB에서 0으로 갱신하므로 다른 PC/브라우저로 로그인해도 반영된다.
-      // 동시에 읽음 커서(read_cursor)도 전진시켜, 카톡식 메시지별 '1' 숫자를 갱신한다.
-      // 1:1도 이 방 스코프 하나로 처리한다(1:1 = 멤버 2명 방).
       else if (data.type === 'unread_clear') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
+        const me = myUserNo(ws);
+        if (!me) return;
         const roomId = Number(data.target);
         if (!Number.isInteger(roomId)) return;
         // 멤버인 경우만 읽음 처리 (권한 판정은 DB 기준)
-        if (!isMember(roomId, senderNickname)) return;
+        if (!isMember(roomId, me)) return;
         const now = Date.now();
-        clearUnread(senderNickname, 'room', String(roomId), now);
-        // 읽음 커서를 이 방의 최신 메시지까지 전진 → 내 메시지 옆 숫자가 0 으로 내려간다
-        markRead(senderNickname, 'room', String(roomId), getLatestRoomMessageId(roomId), now);
+        clearUnread(me, 'room', String(roomId), now);
+        markRead(me, 'room', String(roomId), getLatestRoomMessageId(roomId), now);
         broadcastReadAck('room', String(roomId));
       }
 
       // ─── 안읽은 건수: 현재 상태 재조회 ───
-      // 목록 갱신 없이 배지만 다시 받고 싶을 때 사용 (읽음 처리 후 확인 등)
       else if (data.type === 'unread_query') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
-        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(senderNickname) }));
+        const me = myUserNo(ws);
+        if (!me) return;
+        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(me) }));
       }
 
       // ─── 번호방: 내 목록 새로고침 ───
       else if (data.type === 'room_list') {
-        const senderNickname = clients.get(ws);
-        if (!senderNickname) return;
-        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(senderNickname) }));
+        const me = myUserNo(ws);
+        if (!me) return;
+        ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
       }
     } catch (e) {
       console.error('메시지 파싱 오류:', e);
@@ -613,18 +652,19 @@ wss.on('connection', (ws) => {
   
   // 클라이언트 연결 종료 시 (멤버십 유지 — 재접속 시 내방 복원)
   ws.on('close', () => {
-    const nickname = clients.get(ws);
-    if (nickname) {
+    const no = myUserNo(ws);
+    if (no) {
       clients.delete(ws);
       trackClear(ws);
-      console.log(`${nickname} 연결 종료`);
-      
+      const left = getUserByNo(no);
+      console.log(`user_no=${no} 연결 종료`);
+
       // 모든 클라이언트에게 퇴장 알림
       broadcast({
         type: 'system',
-        text: `${nickname}님이 퇴장했습니다`
+        text: `${left ? left.nickname : `user_no=${no}`}님이 퇴장했습니다`
       });
-      
+
       // 사용자 목록 업데이트 및 전송
       broadcastUserList();
     }
