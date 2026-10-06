@@ -31,6 +31,8 @@ const {
   isRegisteredNo,
   getAllUsers,
   getAllUsersDetail,
+  getAllDepts,
+  upsertDept,
   bumpUnread,
   getUnreadMap,
   clearUnread,
@@ -182,6 +184,20 @@ function broadcastUserList() {
   }
 }
 
+// 부서 목록(미사용 포함 + 인원수)은 admin에게만 전송
+function sendDeptList(client) {
+  if (client.readyState !== WebSocket.OPEN) return;
+  if (!isAdminNo(myUserNo(client))) return;
+  client.send(JSON.stringify({ type: 'dept_list', depts: getAllDepts() }));
+}
+function broadcastDeptList() {
+  try {
+    wss.clients.forEach(sendDeptList);
+  } catch (e) {
+    console.error('부서 목록 전송 실패:', e);
+  }
+}
+
 // 그룹 채팅 기록 조회 — 전체채팅 제거로 더 이상 사용하지 않음 (기존 DB 행은 보존)
 // function getRecentGroupHistory() — deleted
 
@@ -229,6 +245,7 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(user.user_no) }));
         if (isAdminNo(user.user_no)) {
           ws.send(JSON.stringify({ type: 'userlist_detail', usersDetail: getAllUsersDetail() }));
+          sendDeptList(ws);
         }
 
         // 이후 브로드캐스트 — 입장 인사 + 사용자 목록 갱신
@@ -262,6 +279,7 @@ wss.on('connection', (ws) => {
           userName: data.userName ?? data.user_name ?? null,
           timestamp: Date.now(),
           isDeleted: data.isDeleted === true || data.is_deleted === 1 || data.isDeleted === 1,
+          deptNo: data.deptNo,
         });
         if (!result.ok) {
           const texts = {
@@ -270,12 +288,47 @@ wss.on('connection', (ws) => {
             login_id_taken: '이미 사용 중인 아이디입니다. (탈퇴 포함)',
             nickname_taken: '이미 사용 중인 닉네임입니다. (탈퇴 포함)',
             admin_protected: 'admin은 변경할 수 없습니다.',
+            invalid_dept: '사용 중인 부서만 선택할 수 있습니다.',
           };
           ws.send(JSON.stringify({ type: 'user_upsert_result', ok: false, reason: result.reason, text: texts[result.reason] || '사용자 저장에 실패했습니다' }));
           return;
         }
         ws.send(JSON.stringify({ type: 'user_upsert_result', ok: true, user_no: result.user_no }));
         broadcastUserList();
+        broadcastDeptList(); // 부서별 인원수 갱신
+      }
+
+      // ─── 부서 관리: 추가/수정/미사용 (admin 전용) ───
+      else if (data.type === 'dept_upsert') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        if (!isAdminNo(me)) {
+          ws.send(JSON.stringify({ type: 'system', text: '부서 관리는 admin만 할 수 있습니다.' }));
+          return;
+        }
+        const result = upsertDept({
+          deptNo: data.deptNo,
+          deptCode: data.deptCode,
+          deptName: data.deptName,
+          sortOrder: data.sortOrder,
+          isDeleted: data.isDeleted === true,
+          timestamp: Date.now(),
+        });
+        if (!result.ok) {
+          const texts = {
+            invalid_code: '부서코드는 영문/숫자/_/-, 최대 20자입니다.',
+            invalid_name: '부서명을 입력하세요. (최대 30자)',
+            invalid_sort: '정렬순서는 정수로 입력하세요.',
+            code_taken: '이미 사용 중인 부서코드입니다. (미사용 포함)',
+            name_taken: '이미 사용 중인 부서명입니다. (미사용 포함)',
+            has_members: `소속 사용자 ${result.memberCount ?? ''}명이 있어 미사용 처리할 수 없습니다.`,
+            not_found: '부서를 찾을 수 없습니다.',
+          };
+          ws.send(JSON.stringify({ type: 'dept_upsert_result', ok: false, reason: result.reason, text: texts[result.reason] || '부서 저장에 실패했습니다' }));
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'dept_upsert_result', ok: true, deptNo: result.deptNo }));
+        broadcastDeptList();
       }
 
       // ─── 닉네임 변경 (본인 + admin) ───
