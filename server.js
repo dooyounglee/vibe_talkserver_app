@@ -190,15 +190,19 @@ wss.on('connection', (ws) => {
         const myRooms = getMyRooms(user.user_no);
         for (const r of myRooms) trackJoin(ws, r.roomId);
 
-        broadcast({ type: 'system', text: `${user.nickname}님이 입장했습니다` });
-        broadcastUserList();
-        // join_ok에 표시용 닉네임 포함 — 클라는 user_no를 키로, nickname을 표시로 쓴다
+        // 개인 응답을 먼저 보낸다 — join_ok를 userlist보다 먼저 보내야
+        // 클라이언트가 myUserNo를 설정한 상태에서 사용자 목록을 처리할 수 있다.
+        // (join_ok에 표시용 닉네임 포함 — 클라는 user_no를 키로, nickname을 표시로 쓴다)
         ws.send(JSON.stringify({ type: 'join_ok', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
         ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(user.user_no) }));
         if (isAdminNo(user.user_no)) {
           ws.send(JSON.stringify({ type: 'userlist_detail', usersDetail: getAllUsersDetail() }));
         }
+
+        // 이후 브로드캐스트 — 입장 인사 + 사용자 목록 갱신
+        broadcast({ type: 'system', text: `${user.nickname}님이 입장했습니다` });
+        broadcastUserList();
       }
 
       // ─── 사용자 관리: 추가/수정 (admin=user_no 1 전용) ───
