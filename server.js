@@ -465,6 +465,11 @@ wss.on('connection', (ws) => {
           memberNos.push(no);
           if (memberNos.length >= 50) break;
         }
+        // 초대 멤버(본인 제외, 등록 사용자) 0명이면 방을 만들지 않는다 — 클라이언트 가드와 동일 규칙
+        if (memberNos.length === 0) {
+          ws.send(JSON.stringify({ type: 'system', text: '초대할 사용자를 1명 이상 선택하세요.' }));
+          return;
+        }
         // 방 이름은 직접 입력받지 않는다. 실제 멤버 기준 스냅샷으로 생성.
         const legacyName = String(data.name || '').trim().slice(0, 30);
         const nickMap = {};

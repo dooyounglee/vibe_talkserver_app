@@ -11,15 +11,11 @@ const WebSocket = require('ws');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-readreceipt-'));
 const SMOKE_DB = path.join(tmpDir, 'smoke.db');
-const SMOKE_PORT = 8099;
+const SMOKE_PORT = 8110;
 const WS_URL = `ws://localhost:${SMOKE_PORT}`;
 
 const assert = (cond, msg) => {
-  if (!cond) {
-    console.error('FAIL:', msg);
-    cleanup();
-    process.exit(1);
-  }
+  if (!cond) throw new Error(msg);
   console.log('PASS:', msg);
 };
 
@@ -29,18 +25,17 @@ const cleanup = () => {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const connect = (nickname) =>
+const connect = (loginId) =>
   new Promise((resolve, reject) => {
     const ws = new WebSocket(WS_URL);
     const inbox = [];
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', nickname }));
+      ws.send(JSON.stringify({ type: 'join', loginId }));
     });
     ws.on('message', (raw) => {
       try { inbox.push(JSON.parse(String(raw))); } catch { /* 무시 */ }
     });
     ws.on('error', reject);
-    setTimeout(() => reject(new Error(`${nickname} 연결 타임아웃`)), 5000);
     const waitFor = (pred, timeout = 5000) =>
       new Promise((res, rej) => {
         const found = inbox.find(pred);
@@ -56,13 +51,26 @@ const connect = (nickname) =>
       ws, inbox, waitFor,
       send: (o) => ws.send(JSON.stringify(o)),
       close: () => ws.close(),
-      ready: new Promise((res) => {
+      ready: new Promise((res, rej) => {
+        const start = Date.now();
         const iv = setInterval(() => {
-          if (inbox.some((m) => m.type === 'userlist')) { clearInterval(iv); res(); }
+          if (inbox.some((m) => m.type === 'join_ok')) { clearInterval(iv); res(); }
+          else if (inbox.some((m) => m.type === 'join_failed')) { clearInterval(iv); rej(new Error(`${loginId} join_failed`)); }
+          else if (Date.now() - start > 5000) { clearInterval(iv); rej(new Error(`${loginId} join 타임아웃`)); }
         }, 20);
       }),
     });
   });
+
+// admin 으로 사용자 등록 후 user_no 를 돌려준다
+const register = async (admin, loginId, nickname) => {
+  admin.inbox.length = 0;
+  admin.send({ type: 'user_upsert', loginId, nickname, isDeleted: false });
+  const r = await admin.waitFor((m) => m.type === 'user_upsert_result');
+  if (r.ok !== true) throw new Error(`사용자 등록 실패: ${loginId} (${r.reason})`);
+  return r.user_no;
+};
+
 
 // 특정 텍스트 메시지의 unreadCount 를 히스토리에서 찾는다
 const findUnread = (history, text) => {
@@ -82,10 +90,10 @@ const fetchRoomHistory = async (client, roomId) => {
   return client.waitFor((m) => m.type === 'history_room' && m.roomId === roomId);
 };
 // 1:1 방 확보 (find-or-create) 후 방 번호를 돌려준다
-const openOneToOneRoom = async (client, withUser) => {
+const openOneToOneRoom = async (client, withUserNo) => {
   client.inbox.length = 0;
-  client.send({ type: 'dm_room_open', withUser });
-  const opened = await client.waitFor((m) => m.type === 'room_opened' && m.withUser === withUser);
+  client.send({ type: 'dm_room_open', withUserNo });
+  const opened = await client.waitFor((m) => m.type === 'room_opened' && m.withUserNo === withUserNo);
   return opened.roomId;
 };
 
@@ -102,9 +110,9 @@ const openOneToOneRoom = async (client, withUser) => {
 
     a = await connect('admin');
     await a.ready;
-    a.send({ type: 'user_upsert', nickname: 'root', isDeleted: false });
-    a.send({ type: 'user_upsert', nickname: 'other', isDeleted: false });
-    await wait(300);
+    const adminNo = 1; // admin 은 서버가 자동 시드 (user_no=1)
+    const rootNo = await register(a, 'root', 'root');
+    const otherNo = await register(a, 'other', 'other');
     b = await connect('root');
     c = await connect('other');
     await Promise.all([b.ready, c.ready]);
@@ -112,7 +120,7 @@ const openOneToOneRoom = async (client, withUser) => {
 
     // ─── 1:1 읽음 표시 ───
     // 1:1도 방 하나로 관리하므로 읽음 표시는 그룹방과 완전히 같은 규칙이다.
-    const oneToOneId = await openOneToOneRoom(a, 'root');
+    const oneToOneId = await openOneToOneRoom(a, rootNo);
     assert(Number.isInteger(oneToOneId), '1:1방 확보');
 
     // 1. admin 이 root 에게 보냄 → 상대(root)가 안 읽었으므로 admin 화면에 '1'
@@ -144,7 +152,7 @@ const openOneToOneRoom = async (client, withUser) => {
 
     // ─── 단체 읽음 표시 ───
     // 5. 3명 그룹방 생성 (admin + root + other)
-    a.send({ type: 'room_create', members: ['root', 'other'] });
+    a.send({ type: 'room_create', memberNos: [rootNo, otherNo] });
     const created = await a.waitFor((m) => m.type === 'room_created');
     const roomId = created.roomId;
     b.send({ type: 'room_join', roomId });
@@ -185,13 +193,13 @@ const openOneToOneRoom = async (client, withUser) => {
     const ack = await a.waitFor(
       (m) => m.type === 'read_ack' && m.scope === 'room' && String(m.target) === String(roomId),
     );
-    assert(!!ack && Number(ack.cursors?.root) > 0, '읽음 시 read_ack 실시간 전송 (커서 포함)');
+    assert(!!ack && Number(ack.cursors?.[String(rootNo)]) > 0, '읽음 시 read_ack 실시간 전송 (커서 포함)');
 
     // 10-1. read_ack 가 클라이언트 재계산에 필요한 값(참여자 + msgId)을 모두 실어 보내는지
     //       이게 없으면 화면 숫자가 '한 명 읽음 → 0' 으로 한 번에 사라진다 (회귀 방지)
     assert(
-      Array.isArray(ack.members) && ack.members.includes('admin')
-        && ack.members.includes('root') && ack.members.includes('other'),
+      Array.isArray(ack.members) && ack.members.includes(adminNo)
+        && ack.members.includes(rootNo) && ack.members.includes(otherNo),
       'read_ack 에 참여자 목록(members)이 포함됨 — 숫자 재계산에 필수',
     );
 
@@ -217,9 +225,9 @@ const openOneToOneRoom = async (client, withUser) => {
     const clientCount = (cursors, members, sender, msgId) => {
       if (!msgId) return null;
       let n = 0;
-      for (const nick of members || []) {
-        if (!nick || nick === sender) continue;
-        if ((cursors?.[nick] ?? 0) < msgId) n += 1;
+      for (const no of members || []) {
+        if (!no || no === sender) continue;
+        if ((cursors?.[String(no)] ?? 0) < msgId) n += 1;
       }
       return n;
     };
@@ -228,11 +236,11 @@ const openOneToOneRoom = async (client, withUser) => {
     markRead(b, 'room', roomId);
     const ack2 = await a.waitFor(
       (m) => m.type === 'read_ack' && m.scope === 'room'
-        && Number(m.cursors?.root || 0) >= msg3.msgId
-        && Number(m.cursors?.other || 0) < msg3.msgId,
+        && Number(m.cursors?.[String(rootNo)] || 0) >= msg3.msgId
+        && Number(m.cursors?.[String(otherNo)] || 0) < msg3.msgId,
     );
     assert(
-      clientCount(ack2.cursors, ack2.members, 'admin', msg3.msgId) === 1,
+      clientCount(ack2.cursors, ack2.members, adminNo, msg3.msgId) === 1,
       '실시간 감소: root 읽음 → 2 에서 1 로 하나만 감소 (한 번에 사라지지 않음)',
     );
 
@@ -240,10 +248,10 @@ const openOneToOneRoom = async (client, withUser) => {
     markRead(c, 'room', roomId);
     const ack3 = await a.waitFor(
       (m) => m.type === 'read_ack' && m.scope === 'room'
-        && Number(m.cursors?.other || 0) >= msg3.msgId,
+        && Number(m.cursors?.[String(otherNo)] || 0) >= msg3.msgId,
     );
     assert(
-      clientCount(ack3.cursors, ack3.members, 'admin', msg3.msgId) === 0,
+      clientCount(ack3.cursors, ack3.members, adminNo, msg3.msgId) === 0,
       '실시간 감소: other 까지 읽음 → 숫자 소멸',
     );
 

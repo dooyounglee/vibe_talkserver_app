@@ -11,15 +11,11 @@ const WebSocket = require('ws');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-unread-smoke-'));
 const SMOKE_DB = path.join(tmpDir, 'smoke.db');
-const SMOKE_PORT = 8099;
+const SMOKE_PORT = 8111;
 const WS_URL = `ws://localhost:${SMOKE_PORT}`;
 
 const assert = (cond, msg) => {
-  if (!cond) {
-    console.error('FAIL:', msg);
-    cleanup();
-    process.exit(1);
-  }
+  if (!cond) throw new Error(msg);
   console.log('PASS:', msg);
 };
 
@@ -29,18 +25,17 @@ const cleanup = () => {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const connect = (nickname) =>
+const connect = (loginId) =>
   new Promise((resolve, reject) => {
     const ws = new WebSocket(WS_URL);
     const inbox = [];
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', nickname }));
+      ws.send(JSON.stringify({ type: 'join', loginId }));
     });
     ws.on('message', (raw) => {
       try { inbox.push(JSON.parse(String(raw))); } catch { /* 무시 */ }
     });
     ws.on('error', reject);
-    setTimeout(() => reject(new Error(`${nickname} 연결 타임아웃`)), 5000);
     const waitFor = (pred, timeout = 5000) =>
       new Promise((res, rej) => {
         const found = inbox.find(pred);
@@ -56,13 +51,26 @@ const connect = (nickname) =>
       ws, inbox, waitFor,
       send: (o) => ws.send(JSON.stringify(o)),
       close: () => ws.close(),
-      ready: new Promise((res) => {
+      ready: new Promise((res, rej) => {
+        const start = Date.now();
         const iv = setInterval(() => {
-          if (inbox.some((m) => m.type === 'userlist')) { clearInterval(iv); res(); }
+          if (inbox.some((m) => m.type === 'join_ok')) { clearInterval(iv); res(); }
+          else if (inbox.some((m) => m.type === 'join_failed')) { clearInterval(iv); rej(new Error(`${loginId} join_failed`)); }
+          else if (Date.now() - start > 5000) { clearInterval(iv); rej(new Error(`${loginId} join 타임아웃`)); }
         }, 20);
       }),
     });
   });
+
+// admin 으로 사용자 등록 후 user_no 를 돌려준다
+const register = async (admin, loginId, nickname) => {
+  admin.inbox.length = 0;
+  admin.send({ type: 'user_upsert', loginId, nickname, isDeleted: false });
+  const r = await admin.waitFor((m) => m.type === 'user_upsert_result');
+  if (r.ok !== true) throw new Error(`사용자 등록 실패: ${loginId} (${r.reason})`);
+  return r.user_no;
+};
+
 
 // 현재 안읽은 건수를 서버에서 새로 조회해 상태를 확인한다
 const fetchUnread = async (client) => {
@@ -85,8 +93,7 @@ const fetchUnread = async (client) => {
 
     a = await connect('admin');
     await a.ready;
-    a.send({ type: 'user_upsert', nickname: 'root', isDeleted: false });
-    await wait(200);
+    const rootNo = await register(a, 'root', 'root');
     b = await connect('root');
     await b.ready;
     await wait(300);
@@ -98,9 +105,9 @@ const fetchUnread = async (client) => {
     // 2. 방 생성 (admin + root + other = 3명 그룹방)
     // NOTE: 1:1은 별도 배지 없이 이 방 스코프 하나로 관리된다(2명 방을 만들면 1:1이 된다).
     // 그룹방으로 만들어 '내 채팅방' 배지 하나만 검증하면 충분하다.
-    a.send({ type: 'user_upsert', nickname: 'other', isDeleted: false });
-    await wait(200);
-    a.send({ type: 'room_create', name: '테스트방', members: ['root', 'other'] });
+    const otherNo = await register(a, 'other', 'other');
+    a.inbox.length = 0;
+    a.send({ type: 'room_create', memberNos: [rootNo, otherNo] });
     const created = await a.waitFor((m) => m.type === 'room_created');
     const roomId = created.roomId;
 
@@ -113,8 +120,8 @@ const fetchUnread = async (client) => {
     assert(unread.room[String(roomId)] === 1, '방 안읽은 건수가 1로 누적');
 
     // 4. '사용자' 탭에서 연 1:1방도 같은 방 스코프로 배지가 오른다
-    a.send({ type: 'dm_room_open', withUser: 'root' });
-    const opened = await a.waitFor((m) => m.type === 'room_opened' && m.withUser === 'root');
+    a.send({ type: 'dm_room_open', withUserNo: rootNo });
+    const opened = await a.waitFor((m) => m.type === 'room_opened' && m.withUserNo === rootNo);
     const oneToOneRoomId = opened.roomId;
     assert(Number.isInteger(oneToOneRoomId), '1:1방 확보 후 방 번호 반환됨');
     a.send({ type: 'room_message', roomId: oneToOneRoomId, text: '첫 1:1 메시지' });
