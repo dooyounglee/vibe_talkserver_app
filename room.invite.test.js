@@ -66,6 +66,11 @@ try {
   assert(d.getRoomDisplayName(roomId, bobNo) === 'alice', '초대 전 멤버 display_name은 불변(1:1 규칙 bob→alice)');
   const carolRoom = d.getMyRooms(carolNo).find((r) => r.roomId === roomId);
   assert(!!carolRoom && carolRoom.displayName === 'alice,bob,carol', 'carol의 내 채팅방 목록에 새 제목 반영');
+  assert(carolRoom.lastMessage === null, '초대 이전 메시지는 목록 미리보기에도 보이지 않음');
+  assert(
+    d.getMyRooms(aliceNo).find((r) => r.roomId === roomId).lastMessage === 'pre-3',
+    '기존 멤버의 목록 미리보기는 그대로',
+  );
 
   // 초대 이후 메시지 2건
   ['post-1', 'post-2'].forEach((text, i) => {
@@ -85,6 +90,10 @@ try {
   assert(d.getRecentRoomMessages(roomId, 10, aliceNo).length === 5, '기존 멤버는 전체 5건 조회');
   assert(d.getRecentRoomMessages(roomId, 10).length === 5, 'viewer 없으면 기존 동작 그대로 유지');
   assert(d.getRecentRoomMessages(roomId, 10, 999999).length === 0, '방 멤버가 아니면 조회되지 않음(누출 방지)');
+  assert(
+    d.getMyRooms(carolNo).find((r) => r.roomId === roomId).lastMessage === 'post-2',
+    '초대 이후 메시지는 목록 미리보기에 표시',
+  );
 
   // ─── 재초대: 이미 멤버는 추가되지 않고 joined_at도 밀리지 않는다 ───
   const again = d.inviteMembers(roomId, [carolNo], inviteAt + 50);

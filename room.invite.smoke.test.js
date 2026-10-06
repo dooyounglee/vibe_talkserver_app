@@ -1,4 +1,4 @@
-// (임시 검증용) room_invite 핸들러 end-to-end 스모크
+// room_invite 핸들러 end-to-end 스모크
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -126,9 +126,9 @@ const connect = (loginId) => new Promise((resolve, reject) => {
     assert(failed.reason === 'no_targets', '이미 멤버 재초대는 no_targets 실패');
 
     // 비멤버는 초대할 수 없다
-    carol.inbox.length = 0;
-    carol.send({ type: 'room_invite', roomId, memberNos: [bobNo] });
-    const notMember = await carol.waitFor((m) => m.type === 'room_invite_failed');
+    admin.inbox.length = 0;
+    admin.send({ type: 'room_invite', roomId, memberNos: [bobNo] });
+    const notMember = await admin.waitFor((m) => m.type === 'room_invite_failed');
     assert(notMember.reason === 'not_member', '방 멤버가 아니면 초대 불가');
 
     console.log('\nROOM INVITE SMOKE PASSED');

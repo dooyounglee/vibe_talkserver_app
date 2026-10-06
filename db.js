@@ -614,6 +614,7 @@ function getMyRooms(userNo) {
        INNER JOIN room_members m_self ON m_self.room_id = r.room_id AND m_self.user_no = ?
        LEFT JOIN users u ON u.user_no = r.owner_no
        ${lastMessageJoin}
+         AND last_msg.timestamp >= m_self.joined_at -- 초대 시점 이전 메시지는 미리보기에서도 제외
        WHERE r.is_deleted = 0 AND r.is_closed = 0
        ORDER BY r.room_id ASC`
     )
