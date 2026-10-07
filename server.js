@@ -37,6 +37,7 @@ const {
   getUserByLoginId,
   upsertUser,
   renameUser,
+  setUserProfileImage,
   isWithdrawnByNo,
   isRegisteredNo,
   getAllUsers,
@@ -383,7 +384,7 @@ wss.on('connection', (ws) => {
         // 개인 응답을 먼저 보낸다 — join_ok를 userlist보다 먼저 보내야
         // 클라이언트가 myUserNo를 설정한 상태에서 사용자 목록을 처리할 수 있다.
         // (join_ok에 표시용 닉네임 포함 — 클라는 user_no를 키로, nickname을 표시로 쓴다)
-        ws.send(JSON.stringify({ type: 'join_ok', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname }));
+        ws.send(JSON.stringify({ type: 'join_ok', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname, profileImage: user.profileImage }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
         ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(user.user_no) }));
         if (isAdminNo(user.user_no)) {
@@ -502,11 +503,42 @@ wss.on('connection', (ws) => {
         for (const [client, no] of clients.entries()) {
           if (Number(no) !== Number(result.user_no)) continue;
           if (client.readyState !== WebSocket.OPEN) continue;
-          client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname }));
+          client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname, profileImage: updated.profileImage }));
           client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(updated.user_no) }));
         }
       }
       
+      // ─── 프로필 이미지 변경/초기화 (본인) ───
+      // { fileId } = POST /upload 로 올린 이미지 파일 키, { fileId: null } = 기본 이미지로 초기화
+      else if (data.type === 'profile_image_set') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const raw = data.fileId ?? null;
+        const fileKey = raw == null || raw === '' ? null : String(raw);
+        if (fileKey != null && !FILE_KEY_RE.test(fileKey)) {
+          ws.send(JSON.stringify({ type: 'profile_image_result', ok: false, reason: 'not_found', text: '이미지를 찾을 수 없습니다.' }));
+          return;
+        }
+        const result = setUserProfileImage(me, fileKey);
+        if (!result.ok) {
+          const texts = {
+            invalid_user: '로그인이 필요합니다.',
+            not_found: '이미지를 찾을 수 없습니다.',
+            not_image: '이미지 파일만 등록할 수 있습니다.',
+          };
+          ws.send(JSON.stringify({ type: 'profile_image_result', ok: false, reason: result.reason, text: texts[result.reason] || '프로필 이미지 변경에 실패했습니다' }));
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'profile_image_result', ok: true }));
+        // 같은 계정으로 접속한 모든 소켓에 내 프로필 갱신
+        const updated = getUserByNo(me);
+        for (const [client, no] of clients.entries()) {
+          if (Number(no) !== Number(me)) continue;
+          if (client.readyState !== WebSocket.OPEN) continue;
+          client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname, profileImage: updated.profileImage }));
+        }
+      }
+
       // ─── 1:1 대화방 확보: '사용자' 탭에서 상대를 눌러 1:1 창을 열 때 ───
       // 1:1은 "멤버 2명 방" 하나로만 표현한다(별도 DM 개념 없음).
       // 신 규격: { withUserNo } — user_no 기준

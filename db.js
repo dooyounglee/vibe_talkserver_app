@@ -102,6 +102,13 @@ try {
   /* duplicate column — 이미 추가됨 */
 }
 
+// 기존 chat.db 호환: users.profile_file_key 컬럼 추가 (프로필 이미지 = files.file_key, NULL이면 기본 이미지)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN profile_file_key TEXT NULL`);
+} catch {
+  /* duplicate column — 이미 추가됨 */
+}
+
 // ─── 첨부파일 ───
 // 업로드(HTTP POST /upload)된 파일 등록부. file_key는 추측 불가능한 랜덤 키이며
 // 다운로드 URL(/files/:key)에 그대로 쓰인다. 메시지에 첨부되면 msg_id가 채워진다.
@@ -873,7 +880,7 @@ function getUserByNo(userNo) {
   const no = toUserNo(userNo);
   if (!no) return null;
   const row = db
-    .prepare(`SELECT user_no, login_id, nickname, phone, user_name, is_deleted FROM users WHERE user_no = ?`)
+    .prepare(`SELECT user_no, login_id, nickname, phone, user_name, is_deleted, profile_file_key FROM users WHERE user_no = ?`)
     .get(no);
   if (!row) return null;
   return {
@@ -883,6 +890,7 @@ function getUserByNo(userNo) {
     phone: row.phone == null ? null : String(row.phone),
     userName: row.user_name == null ? null : String(row.user_name),
     isDeleted: Number(row.is_deleted) === 1,
+    profileImage: profileImageOf(row.profile_file_key),
   };
 }
 
@@ -890,7 +898,7 @@ function getUserByLoginId(loginId) {
   const id = String(loginId ?? '').trim();
   if (!isValidLoginId(id)) return null;
   const row = db
-    .prepare(`SELECT user_no, login_id, nickname, phone, user_name, is_deleted FROM users WHERE login_id = ?`)
+    .prepare(`SELECT user_no, login_id, nickname, phone, user_name, is_deleted, profile_file_key FROM users WHERE login_id = ?`)
     .get(id);
   if (!row) return null;
   return {
@@ -900,6 +908,7 @@ function getUserByLoginId(loginId) {
     phone: row.phone == null ? null : String(row.phone),
     userName: row.user_name == null ? null : String(row.user_name),
     isDeleted: Number(row.is_deleted) === 1,
+    profileImage: profileImageOf(row.profile_file_key),
   };
 }
 
@@ -1044,6 +1053,28 @@ function upsertDept({ deptNo, deptCode, deptName, sortOrder = 0, isDeleted = fal
   return { ok: true, deptNo: no };
 }
 
+// 프로필 이미지: users.profile_file_key → { id, name, size, mime } (없거나 파일이 사라졌으면 null)
+function profileImageOf(key) {
+  if (!key) return null;
+  const file = getFile(key);
+  if (!file) return null;
+  return { id: file.key, name: file.name, size: file.size, mime: file.mime };
+}
+
+// 프로필 이미지 변경(본인). fileKey=null 이면 기본 이미지로 초기화
+function setUserProfileImage(userNo, fileKey) {
+  const no = toUserNo(userNo);
+  if (!no) return { ok: false, reason: 'invalid_user' };
+  if (fileKey != null) {
+    const file = getFile(fileKey);
+    if (!file) return { ok: false, reason: 'not_found' };
+    if (!String(file.mime).startsWith('image/')) return { ok: false, reason: 'not_image' };
+  }
+  const info = db.prepare(`UPDATE users SET profile_file_key = ? WHERE user_no = ?`).run(fileKey ?? null, no);
+  if (info.changes === 0) return { ok: false, reason: 'not_found' };
+  return { ok: true, user_no: no };
+}
+
 // 닉네임 변경: 본인 또는 admin(user_no=1). 스냅샷은 건드리지 않음.
 function renameUser({ targetNo, newNickname, requesterNo }) {
   const target = toUserNo(targetNo);
@@ -1146,6 +1177,7 @@ module.exports = {
   isNicknameTaken,
   upsertUser,
   renameUser,
+  setUserProfileImage,
   withdrawUser,
   isWithdrawnByNo,
   isRegisteredNo,
