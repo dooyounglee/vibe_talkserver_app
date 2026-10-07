@@ -43,6 +43,7 @@ const {
   changePassword,
   resetPassword,
   setUserProfileImage,
+  setRoomImage,
   isWithdrawnByNo,
   isRegisteredNo,
   getAllUsers,
@@ -277,6 +278,16 @@ function broadcastToRoom(roomId, message) {
     trackJoin(client, roomId);
     client.send(payload);
   });
+}
+
+// 지정한 사용자들의 모든 접속 소켓에 각자의 '내 채팅방' 목록을 다시 보낸다
+function pushMyRoomsTo(userNos) {
+  const targets = new Set(userNos.map((n) => Number(n)));
+  for (const [client, no] of clients.entries()) {
+    if (!targets.has(Number(no))) continue;
+    if (client.readyState !== WebSocket.OPEN) continue;
+    client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(no) }));
+  }
 }
 
 /** read_ack 에 실어 보낼 참여자 목록 (room = 방 멤버 user_no) */
@@ -628,13 +639,48 @@ wss.on('connection', (ws) => {
           client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname, profileImage: updated.profileImage }));
         }
         // 같은 방 멤버들의 채팅창에서 내 메시지 옆 프로필 사진이 바뀌도록 참여자 목록을 다시 보낸다
+        const peerNos = new Set();
         for (const roomId of getRoomIdsOfUser(me)) {
+          const memberNos = getRoomMemberNos(roomId);
           broadcastToRoom(roomId, {
-            type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
+            type: 'room_members', roomId, members: memberNos, memberProfiles: getRoomMembers(roomId),
           });
+          if (memberNos.length === 2) memberNos.forEach((n) => peerNos.add(n));
         }
+        // 1:1방 상대의 '내 채팅방' 목록은 내 프로필 사진을 방 이미지로 쓰므로 목록도 갱신
+        peerNos.delete(Number(me));
+        if (peerNos.size > 0) pushMyRoomsTo([...peerNos]);
         // '사용자' 탭 목록·초대 모달의 프로필 사진도 갱신
         broadcastUserList();
+      }
+
+      // ─── 단체방 이미지 변경/초기화 (사용자별 — 방제목처럼 바꾼 사람에게만 적용) ───
+      // { roomId, fileId } = POST /upload 로 올린 이미지 파일 키, { roomId, fileId: null } = 기본 이미지로 초기화
+      else if (data.type === 'room_image_set') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const roomId = Number(data.roomId);
+        if (!Number.isInteger(roomId)) return;
+        const raw = data.fileId ?? null;
+        const fileKey = raw == null || raw === '' ? null : String(raw);
+        const fail = (reason) => {
+          const texts = {
+            invalid_user: '로그인이 필요합니다.',
+            room_not_found: '채팅방을 찾을 수 없습니다.',
+            not_member: '채팅방 멤버만 변경할 수 있습니다.',
+            not_group: '단체 채팅방만 방 이미지를 변경할 수 있습니다.',
+            not_found: '이미지를 찾을 수 없습니다.',
+            not_image: '이미지 파일만 등록할 수 있습니다.',
+          };
+          ws.send(JSON.stringify({ type: 'room_image_result', roomId, ok: false, reason, text: texts[reason] || '방 이미지 변경에 실패했습니다' }));
+        };
+        if (fileKey != null && !FILE_KEY_RE.test(fileKey)) return fail('not_found');
+        const result = setRoomImage(roomId, me, fileKey);
+        if (!result.ok) return fail(result.reason);
+        console.log(`방 #${roomId} 이미지 ${fileKey ? '변경' : '초기화'} by user_no=${me}`);
+        ws.send(JSON.stringify({ type: 'room_image_result', roomId, ok: true }));
+        // 나에게만 적용되므로 내 계정의 모든 소켓 목록만 갱신 (다른 멤버는 그대로)
+        pushMyRoomsTo([me]);
       }
 
       // ─── 1:1 대화방 확보: '사용자' 탭에서 상대를 눌러 1:1 창을 열 때 ───

@@ -110,6 +110,14 @@ try {
   /* duplicate column — 이미 추가됨 */
 }
 
+// 기존 chat.db 호환: room_members.image_file_key 컬럼 추가
+// (단체방 이미지 = files.file_key, 방제목처럼 사용자별 — 바꾼 사람에게만 적용, NULL이면 기본 이미지)
+try {
+  db.exec(`ALTER TABLE room_members ADD COLUMN image_file_key TEXT NULL`);
+} catch {
+  /* duplicate column — 이미 추가됨 */
+}
+
 // 기존 chat.db 호환: users.password_hash 컬럼 추가 (scrypt 해시, 평문 저장 안 함)
 try {
   db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT NULL`);
@@ -775,8 +783,10 @@ const lastMessageJoin = `
       ) WHERE rn = 1
     ) last_msg ON last_msg.room_id = r.room_id`;
 
-// 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수 + 사용자별 표시제목 + 마지막 메시지
+// 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수 + 사용자별 표시제목 + 마지막 메시지 + 방 이미지
 // displayName: room_members.display_name 스냅샷 (닉변해도 불변), NULL이면 rooms.name 폴백
+// roomImage: 사용자별 단체방 이미지(room_members.image_file_key), peerImage: 1:1방(멤버 2명) 상대의 프로필 이미지
+//   — 둘 다 null이면 클라이언트가 기본 이미지(1:1=사람 실루엣, 단체=여러 사람 실루엣)를 그린다
 function getMyRooms(userNo) {
   const no = toUserNo(userNo);
   if (!no) return [];
@@ -785,6 +795,10 @@ function getMyRooms(userNo) {
       `SELECT r.room_id AS roomId, r.name, r.owner_no AS owner_no, u.nickname AS ownerNickname,
               COALESCE(m_self.display_name, r.name) AS displayName,
               (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.room_id) AS memberCount,
+              m_self.image_file_key AS imageFileKey,
+              (SELECT pu.profile_file_key FROM room_members pm
+                 INNER JOIN users pu ON pu.user_no = pm.user_no
+                WHERE pm.room_id = r.room_id AND pm.user_no != m_self.user_no LIMIT 1) AS peerFileKey,
               last_msg.text AS lastMessage,
               last_msg.file_mime AS lastMessageMime,
               last_msg.timestamp AS lastMessageAt,
@@ -810,6 +824,8 @@ function getMyRooms(userNo) {
     lastMessageAt: r.lastMessageAt == null ? null : Number(r.lastMessageAt),
     lastMessageNo: r.lastMessageNo == null ? null : Number(r.lastMessageNo),
     lastMessageSender: r.lastMessageSender == null ? null : String(r.lastMessageSender),
+    roomImage: profileImageOf(r.imageFileKey),
+    peerImage: Number(r.memberCount) === 2 ? profileImageOf(r.peerFileKey) : null,
   }));
 }
 
@@ -1162,6 +1178,24 @@ function setUserProfileImage(userNo, fileKey) {
   return { ok: true, user_no: no };
 }
 
+// 단체방 이미지 변경(사용자별 — 본인 행만 수정, 다른 멤버는 영향 없음). fileKey=null 이면 기본 이미지로 초기화
+// 1:1방(멤버 2명 이하)은 상대 프로필 사진을 쓰므로 변경할 수 없다.
+function setRoomImage(roomId, userNo, fileKey) {
+  const no = toUserNo(userNo);
+  if (!no) return { ok: false, reason: 'invalid_user' };
+  const room = getRoom(roomId);
+  if (!isRoomActive(room)) return { ok: false, reason: 'room_not_found' };
+  if (!isMember(roomId, no)) return { ok: false, reason: 'not_member' };
+  if (countMembers(roomId) <= 2) return { ok: false, reason: 'not_group' };
+  if (fileKey != null) {
+    const file = getFile(fileKey);
+    if (!file) return { ok: false, reason: 'not_found' };
+    if (!String(file.mime).startsWith('image/')) return { ok: false, reason: 'not_image' };
+  }
+  db.prepare(`UPDATE room_members SET image_file_key = ? WHERE room_id = ? AND user_no = ?`).run(fileKey ?? null, roomId, no);
+  return { ok: true };
+}
+
 // 닉네임 변경: 본인 또는 admin(user_no=1). 스냅샷은 건드리지 않음.
 function renameUser({ targetNo, newNickname, requesterNo }) {
   const target = toUserNo(targetNo);
@@ -1334,6 +1368,7 @@ module.exports = {
   changePassword,
   resetPassword,
   setUserProfileImage,
+  setRoomImage,
   withdrawUser,
   isWithdrawnByNo,
   isRegisteredNo,
