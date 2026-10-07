@@ -188,6 +188,14 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 server.listen(PORT);
 
+// E2E 러너가 IPC 채널로 띄웠을 때만: 'shutdown'을 받으면 정상 종료한다.
+// Windows의 kill()은 강제 종료라 NODE_V8_COVERAGE(서버 커버리지)가 기록되지 않기 때문이다.
+if (process.send) {
+  process.on('message', (m) => {
+    if (m === 'shutdown') process.exit(0);
+  });
+}
+
 // 클라이언트별 user_no 저장 (WebSocket 인스턴스 -> user_no)
 const clients = new Map();
 // 비밀번호 변경 강제 대기 중인 소켓 → user_no.
@@ -470,6 +478,8 @@ wss.on('connection', (ws) => {
           timestamp: Date.now(),
           isDeleted: data.isDeleted === true || data.is_deleted === 1 || data.isDeleted === 1,
           deptNo: data.deptNo,
+          // 'create' | 'edit' (생략 시 기존 동작: 있으면 수정, 없으면 추가)
+          mode: data.mode === 'create' || data.mode === 'edit' ? data.mode : undefined,
         });
         if (!result.ok) {
           const texts = {
@@ -480,6 +490,7 @@ wss.on('connection', (ws) => {
             admin_protected: 'admin은 변경할 수 없습니다.',
             invalid_dept: '사용 중인 부서만 선택할 수 있습니다.',
             phone_required: '전화번호를 입력하세요.',
+            not_found: '사용자를 찾을 수 없습니다.',
             invalid_phone: '전화번호 형식이 올바르지 않습니다. (예: 010-1234-5678)',
           };
           ws.send(JSON.stringify({ type: 'user_upsert_result', ok: false, reason: result.reason, text: texts[result.reason] || '사용자 저장에 실패했습니다' }));

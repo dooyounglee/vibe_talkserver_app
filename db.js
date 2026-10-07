@@ -1066,7 +1066,9 @@ function isNicknameTaken(nickname, exceptNo = null) {
 
 // admin 전용 upsert: login_id 기준 신규/복구/수정. login_id 자체는 변경 불가.
 // deptNo: undefined → 기존 값 유지, null → 부서 없음, 숫자 → 사용 중인 부서만 허용
-function upsertUser({ loginId, nickname, phone = null, userName = null, timestamp, isDeleted = false, deptNo }) {
+// mode: 'create'면 이미 있는 아이디를 거부하고(덮어쓰기 방지), 'edit'면 없는 아이디를 거부한다.
+// 생략하면 예전처럼 아이디가 있으면 수정, 없으면 추가한다.
+function upsertUser({ loginId, nickname, phone = null, userName = null, timestamp, isDeleted = false, deptNo, mode }) {
   const id = String(loginId ?? '').trim();
   const nick = normalizeNickname(nickname);
   if (!isValidLoginId(id)) return { ok: false, reason: 'invalid_login_id' };
@@ -1074,6 +1076,8 @@ function upsertUser({ loginId, nickname, phone = null, userName = null, timestam
   const ts = Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now();
   const deleted = isDeleted ? 1 : 0;
   const existing = getUserByLoginId(id);
+  if (mode === 'create' && existing) return { ok: false, reason: 'login_id_taken' };
+  if (mode === 'edit' && !existing) return { ok: false, reason: 'not_found' };
   if (phone == null || String(phone).trim() === '') return { ok: false, reason: 'phone_required' };
   const phoneVal = normalizePhone(phone);
   if (!phoneVal) return { ok: false, reason: 'invalid_phone' };
