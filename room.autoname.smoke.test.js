@@ -1,6 +1,6 @@
 // 방 이름 자동 생성 규칙 스모크 테스트 (클라이언트 → 서버 → DB → 응답 왕복 검증)
-//   1:1방(총 2명) → 서로의 이름이 뜸 / 3명 이상 → 참여자 이름 오름차순 쉼표 연결
-//   방 이름을 보내지 않아도 서버가 같은 규칙으로 rooms.name/display_name을 채운다
+//   rooms.name = 참여자 전체 이름 오름차순 쉼표 연결 / 표시제목 = 나를 제외한 참여자 이름 (1:1이면 상대 닉네임)
+//   방 이름을 보내지 않아도 서버가 같은 규칙으로 채운다
 // 신 규격: join { loginId }, room_create { memberNos } (user_no 기준)
 const fs = require('fs');
 const path = require('path');
@@ -98,16 +98,16 @@ const createRoom = async (client, memberNos, extra = {}) => {
     const samRoom = sam.inbox.filter((m) => m.type === 'my_rooms').pop().rooms[0];
     assert(samRoom.displayName === 'lee', '1:1 상대 화면에는 방장 닉네임');
 
-    // 2. 3명 이상: 참여자 이름 전체(오름차순 쉼표 연결)가 rooms.name/display_name
+    // 2. 3명 이상: rooms.name은 전체 이름, 표시제목은 나를 제외한 이름
     const group = await createRoom(lee, [samNo, kimNo]);
     assert(group.room.name === 'kim,lee,sam', '그룹 rooms.name = 이름 오름차순 쉼표 연결');
-    assert(group.room.displayName === 'kim,lee,sam', '그룹 표시제목에 모든 참여자 이름');
+    assert(group.room.displayName === 'kim,sam', '그룹 방장(lee) 표시제목 = 나를 제외한 참여자 이름');
     assert(group.room.memberCount === 3, '그룹 인원수는 3');
 
     const kim = await connect('kim'); clients.push(kim); await kim.ready;
     const kimRooms = kim.inbox.filter((m) => m.type === 'my_rooms').pop().rooms;
     const kimGroup = kimRooms.find((r) => r.roomId === group.created.roomId);
-    assert(kimGroup && kimGroup.displayName === 'kim,lee,sam', '초대받은 쪽도 전체 참여자 이름 표시');
+    assert(kimGroup && kimGroup.displayName === 'lee,sam', '초대받은 kim = 나를 제외한 참여자 이름');
 
     // 3. 탈퇴자는 초대 대상에서 제외 → 이름에도 남지 않는다
     const withWithdrawn = await createRoom(lee, [samNo, parkNo]);

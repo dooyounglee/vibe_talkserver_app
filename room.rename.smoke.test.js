@@ -1,7 +1,7 @@
 // 스모크 테스트: 방제목 수정 (사용자별 적용) 검증
 //  - room_rename 요청 → 고친 본인에게만 my_rooms 로 새 제목 반영
 //  - 같은 방의 다른 멤버는 원래 제목 유지
-//  - 1:1방/단체방 모두 동일하게 동작, 예외 입력은 거부
+//  - 1:1방/단체방 모두 동일하게 동작, 빈 제목은 기본 제목(나를 제외한 멤버 나열)으로 복원, 예외 입력은 거부
 // 신 규격: join { loginId }, room_create { memberNos }, dm_room_open { withUserNo }
 const fs = require('fs');
 const path = require('path');
@@ -100,7 +100,7 @@ const listTitleOf = async (client, roomId) => {
     const created = await admin.waitFor((m) => m.type === 'room_created');
     const roomId = created.roomId;
     const autoName = (created.rooms.find((r) => r.roomId === roomId) || {}).displayName;
-    assert(autoName === 'admin,other,root', `단체방 생성됨 (자동 제목 "${autoName}")`);
+    assert(autoName === 'other,root', `단체방 생성됨 (자동 제목 = 나를 제외한 멤버 "${autoName}")`);
 
     assert(await renameAndFetch(admin, roomId, 'admin의 제목') === 'admin의 제목',
       '단체방: 수정한 사람에게 새 제목 적용');
@@ -137,10 +137,9 @@ const listTitleOf = async (client, roomId) => {
       '1:1방도 상대방 제목에는 영향 없음 (상대 닉네임 유지)');
 
     // ─── 3. 예외 처리 ───
-    admin.inbox.length = 0;
-    admin.send({ type: 'room_rename', roomId, title: '   ' });
-    const emptyFail = await admin.waitFor((m) => m.type === 'room_rename_failed');
-    assert(emptyFail.reason === 'empty_title', '빈 제목은 거부');
+    assert(await renameAndFetch(admin, roomId, '   ') === 'other,root',
+      '빈 제목 = 기본 제목(나를 제외한 멤버 나열)으로 복원');
+    assert(await listTitleOf(root, roomId) === 'root의 제목', '복원은 다른 멤버 제목에 영향 없음');
 
     admin.inbox.length = 0;
     admin.send({ type: 'room_rename', roomId: 99999, title: '없는 방' });

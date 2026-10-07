@@ -554,6 +554,13 @@ wss.on('connection', (ws) => {
           client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname, profileImage: updated.profileImage }));
           client.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(updated.user_no) }));
         }
+        // 같은 방 멤버들의 기본 방제(나를 제외한 멤버 닉네임 나열)에 바뀐 닉네임이 들어가므로 목록 갱신
+        const roomPeers = new Set();
+        for (const roomId of getRoomIdsOfUser(updated.user_no)) {
+          for (const n of getRoomMemberNos(roomId)) roomPeers.add(Number(n));
+        }
+        roomPeers.delete(Number(updated.user_no));
+        if (roomPeers.size > 0) pushMyRoomsTo([...roomPeers]);
       }
       
       // ─── 비밀번호 변경 (본인) ───
@@ -1006,6 +1013,8 @@ wss.on('connection', (ws) => {
             type: 'system', roomId,
             text: `${my.nickname}님이 #${roomId} 방에 입장했습니다`,
           });
+          // 기존 멤버의 기본 방제(나를 제외한 멤버 나열)에 새 멤버가 추가된다
+          pushMyRoomsTo(getRoomMemberNos(roomId).filter((n) => Number(n) !== me));
         }
         trackJoin(ws, roomId);
         ws.send(JSON.stringify({
@@ -1029,13 +1038,8 @@ wss.on('connection', (ws) => {
         if (!me) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
+        // 빈 제목 = 직접 지정한 제목을 지우고 기본 방제(나를 제외한 멤버 나열)로 되돌린다
         const title = String(data.title || '').trim();
-        if (!title) {
-          ws.send(JSON.stringify({
-            type: 'room_rename_failed', roomId, reason: 'empty_title',
-          }));
-          return;
-        }
         const room = getRoom(roomId);
         if (!room || room.is_deleted === 1 || room.is_closed === 1) {
           ws.send(JSON.stringify({
@@ -1098,6 +1102,8 @@ wss.on('connection', (ws) => {
           type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
         });
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
+        // 남은 멤버의 기본 방제(나를 제외한 멤버 나열)에서 나간 사람이 빠진다
+        pushMyRoomsTo(getRoomMemberNos(roomId));
       }
 
       // ─── 번호방: 삭제 (방장만, soft delete — DB 보존) ───

@@ -118,6 +118,40 @@ try {
   /* duplicate column — 이미 추가됨 */
 }
 
+// 기존 chat.db 호환(1회): 방제 기본값이 "스냅샷 저장" → "볼 때마다 계산"으로 바뀌었다.
+// 예전에 자동으로 저장된 display_name(생성/초대 시점 닉네임 나열값)은 NULL로 비워 동적 계산을 따르게 하고,
+// 사용자가 직접 바꾼 제목만 남긴다. 판정: ','로 나눈 이름이 모두 rooms.name 스냅샷 또는 현재 멤버 닉네임이면 자동값.
+// user_version으로 한 번만 실행한다 (이후 사용자가 멤버 이름으로 직접 지은 제목을 지우지 않도록).
+try {
+  if (Number(db.pragma('user_version', { simple: true })) < 1) {
+    const rows = db
+      .prepare(
+        `SELECT m.room_id, m.user_no, m.display_name, r.name AS room_name
+         FROM room_members m INNER JOIN rooms r ON r.room_id = m.room_id
+         WHERE m.display_name IS NOT NULL`
+      )
+      .all();
+    const nicksOf = db.prepare(
+      `SELECT u.nickname FROM room_members m INNER JOIN users u ON u.user_no = m.user_no WHERE m.room_id = ?`
+    );
+    const clear = db.prepare(`UPDATE room_members SET display_name = NULL WHERE room_id = ? AND user_no = ?`);
+    const splitNames = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    db.transaction(() => {
+      for (const row of rows) {
+        const known = new Set([
+          ...splitNames(String(row.room_name ?? '').replace(/^1:1\s*/, '')),
+          ...nicksOf.all(row.room_id).map((u) => String(u.nickname ?? '').trim()),
+        ]);
+        const parts = splitNames(row.display_name);
+        if (parts.length === 0 || parts.every((p) => known.has(p))) clear.run(row.room_id, row.user_no);
+      }
+      db.pragma('user_version = 1');
+    })();
+  }
+} catch (e) {
+  console.error('방제 마이그레이션 실패:', e);
+}
+
 // 기존 chat.db 호환: users.password_hash 컬럼 추가 (scrypt 해시, 평문 저장 안 함)
 try {
   db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT NULL`);
@@ -538,7 +572,7 @@ function createRoom({ name, ownerNo, timestamp, memberNos = [], ownerNickname = 
     seen.add(no);
     invited.push(no);
   }
-  // 방 이름: 닉네임 스냅샷 기준 자동 연결 (이후 닉변해도 불변)
+  // rooms.name: 생성 시점 닉네임 스냅샷 (로그/레거시용 — 화면 방제는 getMyRooms가 계산)
   const nickOf = (no) => {
     if (memberNicknames && memberNicknames[String(no)] != null) return String(memberNicknames[String(no)]);
     if (Number(no) === Number(owner)) return String(ownerNickname || '');
@@ -549,18 +583,15 @@ function createRoom({ name, ownerNo, timestamp, memberNos = [], ownerNickname = 
     .prepare(`INSERT INTO rooms (name, owner_no, created_at) VALUES (?, ?, ?)`)
     .run(String(name ?? '').trim() || autoName, owner, timestamp);
   const roomId = Number(info.lastInsertRowid);
-  // 표시제목(display_name) 규칙 — 생성 시점 스냅샷, 이후 닉변해도 갱신 안 함
-  const isOneToOne = invited.length === 1;
-  const ownerDisplay = isOneToOne ? nickOf(invited[0]) : autoName;
-  db.prepare(`INSERT INTO room_members (room_id, user_no, joined_at, display_name) VALUES (?, ?, ?, ?)`)
-    .run(roomId, owner, timestamp, ownerDisplay);
+  // 표시제목(display_name)은 비워 둔다(NULL) → getMyRooms가 "나를 제외한 현재 멤버 닉네임"으로 매번 계산
+  db.prepare(`INSERT INTO room_members (room_id, user_no, joined_at, display_name) VALUES (?, ?, ?, NULL)`)
+    .run(roomId, owner, timestamp);
   let seq = 1;
   for (const no of invited) {
     try {
-      const memberDisplay = isOneToOne ? nickOf(owner) : autoName;
       db.prepare(
-        `INSERT OR IGNORE INTO room_members (room_id, user_no, joined_at, display_name) VALUES (?, ?, ?, ?)`
-      ).run(roomId, no, timestamp + seq, memberDisplay);
+        `INSERT OR IGNORE INTO room_members (room_id, user_no, joined_at, display_name) VALUES (?, ?, ?, NULL)`
+      ).run(roomId, no, timestamp + seq);
       seq += 1;
     } catch {
       // 무시 (개별 멤버 추가 실패가 방 생성을 막지 않음)
@@ -642,8 +673,8 @@ function addMember(roomId, userNo, timestamp) {
 }
 
 // ─── 초대: 운영 중인 방에 멤버 추가 ───
-// 초대받은 멤버의 display_name에는 "전체 멤버 닉네임을 오름차순으로 이어 붙인 값"을 저장한다.
-// (초대받은 사람에게 적용될 채팅방 제목 기본값. 기존 멤버의 display_name은 건드리지 않는다)
+// 방제는 저장하지 않는다(display_name NULL) — 멤버가 바뀌면 getMyRooms가 모두의 기본 방제를 다시 계산한다.
+// (1:1방에 초대해 단체방이 되면 기존 두 멤버의 방제도 자동으로 "나를 제외한 멤버 나열"이 된다)
 // 반환: { added: 이번에 새로 들어온 user_no[], memberNos: 초대 후 전체 멤버 user_no[] }
 function inviteMembers(roomId, userNos, timestamp) {
   const rid = Number(roomId);
@@ -661,20 +692,10 @@ function inviteMembers(roomId, userNos, timestamp) {
     seq += 1;
     added.push(no);
   }
-  if (added.length > 0) {
-    // 전체 멤버 닉네임 나열값을 "초대받은 멤버"의 제목 기본값으로만 저장한다.
-    const nicks = getRoomMembers(rid).map((m) => m.nickname);
-    const title = joinMemberNames('', nicks); // 빈 값/중복 제거 + localeCompare 오름차순 연결
-    for (const no of added) {
-      db.prepare(
-        `UPDATE room_members SET display_name = ? WHERE room_id = ? AND user_no = ?`
-      ).run(title, rid, no);
-    }
-  }
   return { added, memberNos: getRoomMemberNos(rid) };
 }
 
-// 사용자별 방 제목 조회 (없으면 NULL → 호출자가 rooms.name 폴백)
+// 사용자가 직접 지정한 방 제목 조회 (없으면 NULL → 기본 방제는 getMyRooms가 계산)
 function getRoomDisplayName(roomId, userNo) {
   try {
     const no = toUserNo(userNo);
@@ -689,14 +710,15 @@ function getRoomDisplayName(roomId, userNo) {
 }
 
 // 사용자별 방 제목 저장 (본인 행만 수정, 30자 제한)
+// 빈 값이면 NULL로 되돌려 기본 방제(나를 제외한 멤버 나열)를 다시 따른다.
 function setRoomDisplayName(roomId, userNo, displayName) {
   const name = String(displayName || '').trim().slice(0, 30);
   const no = toUserNo(userNo);
-  if (!name || !no) return false;
+  if (!no) return false;
   try {
     const info = db
       .prepare(`UPDATE room_members SET display_name = ? WHERE room_id = ? AND user_no = ?`)
-      .run(name, roomId, no);
+      .run(name || null, roomId, no);
     return Number(info.changes) > 0;
   } catch {
     return false;
@@ -719,7 +741,7 @@ function countMembers(roomId) {
   return row ? Number(row.cnt) : 0;
 }
 
-// 방 멤버: [{user_no, nickname(현재), joined_at, profileImage}] — 표시는 JOIN resolve, 방제는 display_name 스냅샷 유지
+// 방 멤버: [{user_no, nickname(현재), joined_at, profileImage}] — 표시는 JOIN resolve
 // profileImage: 채팅창에서 상대 메시지 옆 프로필 사진 표시용 (없으면 null = 기본 이미지)
 function getRoomMembers(roomId) {
   return db
@@ -784,16 +806,30 @@ const lastMessageJoin = `
     ) last_msg ON last_msg.room_id = r.room_id`;
 
 // 내가 속한 활성방 목록 (삭제/폐쇄 제외) + 인원수 + 사용자별 표시제목 + 마지막 메시지 + 방 이미지
-// displayName: room_members.display_name 스냅샷 (닉변해도 불변), NULL이면 rooms.name 폴백
+// displayName: 내가 직접 지정한 제목(room_members.display_name)이 있으면 그것,
+//   없으면 "나를 제외한 현재 멤버의 현재 닉네임" 오름차순 연결 (카톡 기본 방제와 같음, 1:1이면 상대 닉네임)
+//   — 볼 때마다 계산하므로 초대/나가기/닉네임 변경이 바로 반영된다. 나만 남으면 '대화상대 없음'
 // roomImage: 사용자별 단체방 이미지(room_members.image_file_key), peerImage: 1:1방(멤버 2명) 상대의 프로필 이미지
 //   — 둘 다 null이면 클라이언트가 기본 이미지(1:1=사람 실루엣, 단체=여러 사람 실루엣)를 그린다
+const EMPTY_ROOM_TITLE = '대화상대 없음';
+// 직접 지정한 제목 > 나를 제외한 멤버 닉네임 나열(otherNicknames: char(31) 구분) > '대화상대 없음'
+function defaultRoomTitle(customName, otherNicknames) {
+  const custom = String(customName ?? '').trim();
+  if (custom) return custom;
+  const others = otherNicknames == null ? [] : String(otherNicknames).split(String.fromCharCode(31));
+  return joinMemberNames('', others) || EMPTY_ROOM_TITLE;
+}
+
 function getMyRooms(userNo) {
   const no = toUserNo(userNo);
   if (!no) return [];
   const rows = db
     .prepare(
       `SELECT r.room_id AS roomId, r.name, r.owner_no AS owner_no, u.nickname AS ownerNickname,
-              COALESCE(m_self.display_name, r.name) AS displayName,
+              m_self.display_name AS customName,
+              (SELECT GROUP_CONCAT(ou.nickname, char(31)) FROM room_members om
+                 INNER JOIN users ou ON ou.user_no = om.user_no
+                WHERE om.room_id = r.room_id AND om.user_no != m_self.user_no) AS otherNicknames,
               (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.room_id) AS memberCount,
               m_self.image_file_key AS imageFileKey,
               (SELECT pu.profile_file_key FROM room_members pm
@@ -819,7 +855,7 @@ function getMyRooms(userNo) {
     owner_no: Number(r.owner_no),
     owner: r.ownerNickname != null ? String(r.ownerNickname) : '',
     memberCount: r.memberCount,
-    displayName: r.displayName && String(r.displayName).trim() !== '' ? String(r.displayName) : r.name,
+    displayName: defaultRoomTitle(r.customName, r.otherNicknames),
     lastMessage: r.lastMessage == null ? null : previewTextOf(String(r.lastMessage), r.lastMessageMime),
     lastMessageAt: r.lastMessageAt == null ? null : Number(r.lastMessageAt),
     lastMessageNo: r.lastMessageNo == null ? null : Number(r.lastMessageNo),

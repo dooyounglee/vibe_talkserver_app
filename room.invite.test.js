@@ -1,5 +1,6 @@
 // 방 초대(invite) 테스트
-//   1) 요구5: 초대받은 사람의 방 제목 기본값 = 전체 멤버 닉네임 나열값 (기존 멤버 display_name 불변)
+//   1) 방제 기본값 = 나를 제외한 현재 멤버 닉네임 나열 → 1:1방에 초대해 단체방이 되면 기존 두 멤버의 방제도 바뀐다
+//      (직접 수정한 제목은 유지)
 //   2) 요구6: 초대받은 사람은 초대 시점(joined_at) 이후의 메시지만 조회
 //   3) 중복/기존 멤버 초대는 추가되지 않는다
 const path = require('path');
@@ -57,20 +58,25 @@ try {
   assert(d.isMember(roomId, carolNo), '초대받은 사람이 멤버로 등록됨');
   assert(res.memberNos.length === 3, '초대 후 멤버는 3명');
 
-  // ─── 요구5: 초대받은 사람 제목 = 닉네임 나열값, 기존 멤버는 불변 ───
-  assert(
-    d.getRoomDisplayName(roomId, carolNo) === 'alice,bob,carol',
-    '초대받은 사람 display_name = 전체 멤버 닉네임 나열값',
-  );
-  assert(d.getRoomDisplayName(roomId, aliceNo) === 'bob', '초대 전 멤버 display_name은 불변(1:1 규칙 alice→bob)');
-  assert(d.getRoomDisplayName(roomId, bobNo) === 'alice', '초대 전 멤버 display_name은 불변(1:1 규칙 bob→alice)');
+  // ─── 1:1→단체 전환: 세 명 모두 "나를 제외한 멤버 나열" (결함 재현: 기존 두 멤버가 1:1 방제를 계속 보던 문제) ───
+  const titleOf = (no, rid) => d.getMyRooms(no).find((r) => r.roomId === rid).displayName;
+  assert(titleOf(aliceNo, roomId) === 'bob,carol', '1:1→단체 전환: 기존 멤버 alice → bob,carol');
+  assert(titleOf(bobNo, roomId) === 'alice,carol', '1:1→단체 전환: 기존 멤버 bob → alice,carol');
   const carolRoom = d.getMyRooms(carolNo).find((r) => r.roomId === roomId);
-  assert(!!carolRoom && carolRoom.displayName === 'alice,bob,carol', 'carol의 내 채팅방 목록에 새 제목 반영');
+  assert(!!carolRoom && carolRoom.displayName === 'alice,bob', '초대받은 carol → alice,bob');
   assert(carolRoom.lastMessage === null, '초대 이전 메시지는 목록 미리보기에도 보이지 않음');
   assert(
     d.getMyRooms(aliceNo).find((r) => r.roomId === roomId).lastMessage === 'pre-3',
     '기존 멤버의 목록 미리보기는 그대로',
   );
+
+  // ─── 1:1→단체 전환이어도 직접 수정한 제목은 유지 ('사용자' 탭 1:1방 = ensureOneToOneRoom) ───
+  const oneRoom = d.ensureOneToOneRoom(aliceNo, bobNo, now + 200, nickOf);
+  assert(d.setRoomDisplayName(oneRoom, aliceNo, '우리둘'), 'alice가 1:1방 제목을 직접 수정');
+  d.inviteMembers(oneRoom, [carolNo], now + 300);
+  assert(titleOf(aliceNo, oneRoom) === '우리둘', '직접 수정한 제목은 단체 전환 후에도 유지');
+  assert(titleOf(bobNo, oneRoom) === 'alice,carol', '수정 안 한 bob은 나를 제외한 멤버 나열');
+  assert(titleOf(carolNo, oneRoom) === 'alice,bob', '초대받은 carol도 나를 제외한 멤버 나열');
 
   // 초대 이후 메시지 2건
   ['post-1', 'post-2'].forEach((text, i) => {

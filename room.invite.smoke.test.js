@@ -87,6 +87,7 @@ const connect = (loginId) => new Promise((resolve, reject) => {
     // ─── 초대 ───
     carol.inbox.length = 0;
     alice.inbox.length = 0;
+    bob.inbox.length = 0;
     alice.send({ type: 'room_invite', roomId, memberNos: [carolNo, carolNo, aliceNo] });
     await wait(600);
 
@@ -98,13 +99,19 @@ const connect = (loginId) => new Promise((resolve, reject) => {
     const carolRooms = carol.inbox.filter((m) => m.type === 'my_rooms').pop();
     const carolRoom = carolRooms && carolRooms.rooms.find((r) => r.roomId === roomId);
     assert(!!carolRoom, '초대받은 사람 목록에 방 노출');
-    assert(carolRoom.displayName === 'alice,bob,carol', '초대받은 사람 제목 = 닉네임 나열값');
+    assert(carolRoom.displayName === 'alice,bob', '초대받은 사람 제목 = 나를 제외한 멤버 나열');
 
     const membersMsg = alice.inbox.find((m) => m.type === 'room_members' && m.roomId === roomId);
     assert(!!membersMsg && membersMsg.members.length === 3, 'room_members 갱신(3명)');
 
     const aliceRooms = alice.inbox.filter((m) => m.type === 'my_rooms').pop();
     assert(!!aliceRooms, '초대한 사람에게 my_rooms 갱신');
+    // 1:1→단체 전환: 기존 두 멤버의 방제도 실시간으로 "나를 제외한 멤버 나열"로 바뀐다 (결함 재현 케이스)
+    assert(aliceRooms.rooms.find((r) => r.roomId === roomId).displayName === 'bob,carol',
+      '초대한 alice 제목 = bob,carol');
+    const bobRooms = bob.inbox.filter((m) => m.type === 'my_rooms').pop();
+    assert(!!bobRooms && bobRooms.rooms.find((r) => r.roomId === roomId).displayName === 'alice,carol',
+      '기존 멤버 bob도 my_rooms 갱신, 제목 = alice,carol');
 
     // 초대 이후 메시지 → carol에게 보인다
     alice.send({ type: 'room_message', roomId, text: 'post-1' });

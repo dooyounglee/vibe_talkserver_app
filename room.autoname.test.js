@@ -1,6 +1,6 @@
 // 방 이름 자동 생성 규칙 테스트
-//   1:1방(총 2명) → 서로의 이름이 뜸(상대 닉네임) / 3명 이상 → 참여자 이름 오름차순 쉼표 연결
-//   DB에는 모든 참여자 이름이 room_members.display_name으로 들어간다
+//   rooms.name = 참여자 전체 이름 오름차순 쉼표 연결 (생성 시점 스냅샷)
+//   표시제목 = 나를 제외한 참여자 이름 (1:1이면 상대 닉네임) — display_name은 저장하지 않고(NULL) 매번 계산
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -55,24 +55,24 @@ try {
   assert(d.getRoom(r1).name === 'lee,sam', '1:1 rooms.name 자동 생성');
   assert(d.getMyRooms(noOf.lee)[0].displayName === 'sam', '1:1 방장 화면에는 상대 닉네임');
   assert(d.getMyRooms(noOf.sam)[0].displayName === 'lee', '1:1 상대 화면에는 방장 닉네임');
-  assert(d.getRoomDisplayName(r1, noOf.lee) === 'sam', '1:1 display_name 저장값');
+  assert(d.getRoomDisplayName(r1, noOf.lee) === null, '1:1 display_name은 저장하지 않음(동적 계산)');
 
-  // ── 3명 이상: 참여자 전체 이름(오름차순 쉼표 연결)이 rooms.name/display_name ──
+  // ── 3명 이상: rooms.name은 전체 이름, 표시제목은 나를 제외한 이름 ──
   const r2 = mkRoom('', 'lee', now + 100, ['sam', 'kim']);
   assert(d.getRoom(r2).name === 'kim,lee,sam', '그룹 rooms.name 자동 생성');
   assert(d.getRoomMembers(r2).length === 3, '그룹 멤버 3명 등록');
-  for (const nick of ['lee', 'sam', 'kim']) {
+  for (const [nick, expected] of [['lee', 'kim,sam'], ['sam', 'kim,lee'], ['kim', 'lee,sam']]) {
     const info = d.getMyRooms(noOf[nick]).find((r) => r.roomId === r2);
-    assert(info && info.displayName === 'kim,lee,sam', `그룹 ${nick} 화면에 전체 참여자 이름`);
+    assert(info && info.displayName === expected, `그룹 ${nick} 화면에 나를 제외한 참여자 이름(${expected})`);
   }
 
-  // ── DB에는 전체 이름이 그대로 들어간다(화면 축약은 클라이언트 responsibility) ──
+  // ── 서버는 전체 이름을 그대로 내려준다(화면 축약은 클라이언트 responsibility) ──
   const long = ['aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'cccccccccccc'];
   long.forEach((nick, i) => register(`long${i}`, nick));
   const r3 = mkRoom('', long[0], now + 200, long.slice(1));
-  const full = long.join(',');
+  const full = long.slice(1).join(',');
   assert(full.length > 20, '테스트 값이 실제로 20자를 넘는지 확인');
-  assert(d.getRoomDisplayName(r3, noOf[long[0]]) === full, '긴 이름도 DB에는 20자 축약 없이 전체 저장');
+  assert(d.getMyRooms(noOf[long[0]]).find((r) => r.roomId === r3).displayName === full, '긴 이름도 20자 축약 없이 전체 전달');
 
   // ── 전달된 이름이 있으면 그것을 유지 (DM 자동방 등 기존 호출부 호환) ──
   const r4 = mkRoom('1:1 a,b', 'a', now + 300, ['b']);
