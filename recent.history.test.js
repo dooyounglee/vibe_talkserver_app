@@ -143,6 +143,39 @@ try {
     '초대 이전 메시지(msg-0 ~ msg-9)는 이전 페이지에서도 제외'
   );
 
+  // ─── 메시지 검색 (searchRoomMessages) ───
+  const textOfId = Object.fromEntries(
+    dbm.getRoomMessagesPage(roomId, null, { limit: 50 }).messages.map((m) => [m.id, m.text])
+  );
+  const hit = dbm.searchRoomMessages(roomId, null, 'msg-1');
+  assert(
+    hit.ids.map((id) => textOfId[id]).join(',') === 'msg-14,msg-13,msg-12,msg-11,msg-10,msg-1',
+    '검색: 포함 매칭, 최신 → 과거 순'
+  );
+  assert(hit.truncated === false, '검색: 상한 미만이면 truncated=false');
+  assert(dbm.searchRoomMessages(roomId, null, 'MSG-14').ids.length === 1, '검색: 영문 대소문자 무시');
+  assert(dbm.searchRoomMessages(roomId, null, '%').ids.length === 0, '검색: % 는 와일드카드가 아닌 문자');
+  assert(dbm.searchRoomMessages(roomId, null, '_').ids.length === 0, '검색: _ 는 와일드카드가 아닌 문자');
+  assert(dbm.searchRoomMessages(roomId, null, '   ').ids.length === 0, '검색: 빈 검색어는 결과 없음');
+  assert(dbm.searchRoomMessages(roomId, null, 'msg', 4).truncated === true, '검색: 상한 초과 시 truncated=true');
+  assert(dbm.searchRoomMessages(dmRoom, null, 'msg-1').ids.length === 0, '검색: 다른 방 메시지는 제외');
+  assert(
+    dbm.searchRoomMessages(roomId, carolNo, 'msg-1').ids.map((id) => textOfId[id]).join(',') ===
+      'msg-14,msg-13,msg-12,msg-11,msg-10',
+    '검색: 초대 이전 메시지(msg-1)는 제외'
+  );
+
+  // ─── 검색 결과 점프 (getRoomMessagesAround) ───
+  const id7 = Number(Object.keys(textOfId).find((id) => textOfId[id] === 'msg-7'));
+  const around = dbm.getRoomMessagesAround(roomId, null, id7, 2);
+  assert(
+    around.messages.map((m) => m.text).join(',') === 'msg-5,msg-6,msg-7,msg-8,msg-9',
+    '점프: 대상 앞뒤 2건씩 (오래된 → 최신)'
+  );
+  assert(around.hasMore === true && around.hasNewer === true, '점프: 앞뒤로 더 있음');
+  const id14 = Number(Object.keys(textOfId).find((id) => textOfId[id] === 'msg-14'));
+  assert(dbm.getRoomMessagesAround(roomId, null, id14, 2).hasNewer === false, '점프: 최신 메시지면 hasNewer=false');
+
   console.log('\nALL RECENT HISTORY TESTS PASSED');
   cleanup();
 } catch (e) {

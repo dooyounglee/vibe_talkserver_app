@@ -102,6 +102,29 @@ try {
   /* duplicate column — 이미 추가됨 */
 }
 
+// ─── 첨부파일 ───
+// 업로드(HTTP POST /upload)된 파일 등록부. file_key는 추측 불가능한 랜덤 키이며
+// 다운로드 URL(/files/:key)에 그대로 쓰인다. 메시지에 첨부되면 msg_id가 채워진다.
+// 실제 바이트는 uploads/<file_key> 에 저장한다.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS files (
+    file_key TEXT PRIMARY KEY,
+    file_name TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    file_mime TEXT NOT NULL,
+    uploaded_at INTEGER NOT NULL,
+    msg_id INTEGER NULL
+  )
+`);
+// 기존 chat.db 호환: messages 첨부 컬럼 추가 (이미 있으면 무시)
+for (const col of ['file_key TEXT NULL', 'file_name TEXT NULL', 'file_size INTEGER NULL', 'file_mime TEXT NULL']) {
+  try {
+    db.exec(`ALTER TABLE messages ADD COLUMN ${col}`);
+  } catch {
+    /* duplicate column — 이미 추가됨 */
+  }
+}
+
 // 'admin' 시드 (user_no=1 보장: 최초 INSERT)
 try {
   db.prepare(
@@ -354,15 +377,60 @@ try {
 
 // 메시지 저장용 prepared statement (sender_no + sender_name 스냅샷)
 const insertMessageStmt = db.prepare(
-  'INSERT INTO messages (room_type, sender_no, sender_name, text, timestamp, room_id) VALUES (?, ?, ?, ?, ?, ?)'
+  `INSERT INTO messages (room_type, sender_no, sender_name, text, timestamp, room_id, file_key, file_name, file_size, file_mime)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 );
 
 // 메시지 저장 (roomType: "room", roomId는 방번호)
 // sender_name은 발송 시점 nickname 스냅샷 — 이후 닉변해도 UPDATE하지 않는다.
-function saveMessage({ roomType, senderNo, senderName, text, timestamp, roomId = null }) {
+// file: 첨부파일 메시지면 { key, name, size, mime } (text에는 파일명을 넣어 검색/미리보기에 쓴다)
+function saveMessage({ roomType, senderNo, senderName, text, timestamp, roomId = null, file = null }) {
   const no = toUserNo(senderNo);
   if (!no) throw new Error('senderNo required');
-  return insertMessageStmt.run(roomType, no, String(senderName ?? ''), text, timestamp, roomId);
+  return insertMessageStmt.run(
+    roomType, no, String(senderName ?? ''), text, timestamp, roomId,
+    file ? file.key : null, file ? file.name : null, file ? file.size : null, file ? file.mime : null,
+  );
+}
+
+// ─── 첨부파일 등록부 ───
+function registerFile({ key, name, size, mime, timestamp }) {
+  db.prepare(
+    `INSERT INTO files (file_key, file_name, file_size, file_mime, uploaded_at) VALUES (?, ?, ?, ?, ?)`
+  ).run(key, name, size, mime, timestamp);
+}
+
+function getFile(key) {
+  const row = db.prepare(`SELECT * FROM files WHERE file_key = ?`).get(String(key ?? ''));
+  if (!row) return null;
+  return {
+    key: row.file_key,
+    name: row.file_name,
+    size: Number(row.file_size),
+    mime: row.file_mime,
+    msgId: row.msg_id == null ? null : Number(row.msg_id),
+  };
+}
+
+function attachFile(key, msgId) {
+  db.prepare(`UPDATE files SET msg_id = ? WHERE file_key = ?`).run(msgId, key);
+}
+
+// 메시지 행의 첨부 컬럼 → 클라이언트 전송용 { id, name, size, mime } (없으면 undefined)
+function fileOfRow(row) {
+  if (!row || !row.file_key) return undefined;
+  return {
+    id: String(row.file_key),
+    name: String(row.file_name ?? ''),
+    size: Number(row.file_size) || 0,
+    mime: String(row.file_mime ?? 'application/octet-stream'),
+  };
+}
+
+// 목록 미리보기용 문구: 이미지면 '사진', 그 외 파일이면 '파일: 이름'
+function previewTextOf(text, mime) {
+  if (mime == null) return text;
+  return String(mime).startsWith('image/') ? '사진' : `파일: ${text}`;
 }
 
 // ─── 번호방 CRUD ───
@@ -612,8 +680,8 @@ function transferOwner(roomId, newOwnerNo) {
 // 마지막 메시지 요약: 방별 가장 최근 1건 (내용/시간/발신자 스냅샷)
 const lastMessageJoin = `
     LEFT JOIN (
-      SELECT room_id, text, timestamp, sender_no, sender_name FROM (
-        SELECT room_id, text, timestamp, sender_no, sender_name,
+      SELECT room_id, text, timestamp, sender_no, sender_name, file_mime FROM (
+        SELECT room_id, text, timestamp, sender_no, sender_name, file_mime,
                ROW_NUMBER() OVER (PARTITION BY room_id ORDER BY timestamp DESC, id DESC) AS rn
         FROM messages
         WHERE room_type = 'room' AND room_id IS NOT NULL
@@ -631,6 +699,7 @@ function getMyRooms(userNo) {
               COALESCE(m_self.display_name, r.name) AS displayName,
               (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.room_id) AS memberCount,
               last_msg.text AS lastMessage,
+              last_msg.file_mime AS lastMessageMime,
               last_msg.timestamp AS lastMessageAt,
               last_msg.sender_no AS lastMessageNo,
               last_msg.sender_name AS lastMessageSender
@@ -650,7 +719,7 @@ function getMyRooms(userNo) {
     owner: r.ownerNickname != null ? String(r.ownerNickname) : '',
     memberCount: r.memberCount,
     displayName: r.displayName && String(r.displayName).trim() !== '' ? String(r.displayName) : r.name,
-    lastMessage: r.lastMessage == null ? null : String(r.lastMessage),
+    lastMessage: r.lastMessage == null ? null : previewTextOf(String(r.lastMessage), r.lastMessageMime),
     lastMessageAt: r.lastMessageAt == null ? null : Number(r.lastMessageAt),
     lastMessageNo: r.lastMessageNo == null ? null : Number(r.lastMessageNo),
     lastMessageSender: r.lastMessageSender == null ? null : String(r.lastMessageSender),
@@ -681,7 +750,7 @@ function closeRoomIfEmpty(roomId, timestamp) {
 function getRoomHistory(roomId, limit = 50) {
   const rows = db
     .prepare(
-      `SELECT id, sender_no, sender_name, text, timestamp FROM messages
+      `SELECT id, sender_no, sender_name, text, timestamp, file_key, file_name, file_size, file_mime FROM messages
        WHERE room_type = 'room' AND room_id = ?
        ORDER BY timestamp DESC, id DESC
        LIMIT ?`
@@ -693,6 +762,7 @@ function getRoomHistory(roomId, limit = 50) {
     nickname: String(row.sender_name ?? ''),
     text: row.text,
     timestamp: row.timestamp,
+    file: fileOfRow(row),
   }));
 }
 
@@ -722,7 +792,7 @@ function getRoomMessagesPage(roomId, viewerNo = null, { beforeId = null, afterId
 
   const rows = db
     .prepare(
-      `SELECT id, sender_no, sender_name, text, timestamp FROM messages
+      `SELECT id, sender_no, sender_name, text, timestamp, file_key, file_name, file_size, file_mime FROM messages
        WHERE ${where.join(' AND ')}
        ORDER BY id ${order}
        LIMIT ?`
@@ -739,7 +809,53 @@ function getRoomMessagesPage(roomId, viewerNo = null, { beforeId = null, afterId
       nickname: String(row.sender_name ?? ''),
       text: row.text,
       timestamp: row.timestamp,
+      file: fileOfRow(row),
     })),
+  };
+}
+
+// 검색 결과 점프용: targetId 를 가운데 둔 한 페이지 (오래된 → 최신 순)
+//   이전쪽 half+1건(대상 포함) + 이후쪽 half건. hasMore=더 이전, hasNewer=더 이후가 있는지.
+function getRoomMessagesAround(roomId, viewerNo, targetId, half = 15) {
+  const target = toUserNo(targetId);
+  if (!target) return { messages: [], hasMore: false, hasNewer: false };
+  const older = getRoomMessagesPage(roomId, viewerNo, { beforeId: target + 1, limit: half + 1 });
+  const newer = getRoomMessagesPage(roomId, viewerNo, { afterId: target, limit: half });
+  return {
+    messages: [...older.messages, ...newer.messages],
+    hasMore: older.hasMore,
+    hasNewer: newer.hasMore,
+  };
+}
+
+// 채팅창 메시지 검색: 본문에 keyword 가 포함된 메시지 id 목록 (최신 → 과거 순)
+// viewerNo 를 주면 getRoomMessagesPage 와 같이 초대받은 시점 이후만 검색한다.
+// limit 건을 넘으면 truncated=true.
+const SEARCH_MAX_RESULTS = 300;
+function searchRoomMessages(roomId, viewerNo, keyword, limit = SEARCH_MAX_RESULTS) {
+  const kw = String(keyword ?? '').trim();
+  if (kw === '') return { ids: [], truncated: false };
+  const size = Math.min(Math.max(Number.parseInt(limit, 10) || SEARCH_MAX_RESULTS, 1), SEARCH_MAX_RESULTS);
+  const viewer = toUserNo(viewerNo);
+  const pattern = `%${kw.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+
+  const where = [`room_type = 'room'`, `room_id = ?`, `text LIKE ? ESCAPE '\\'`];
+  const params = [roomId, pattern];
+  if (viewer) {
+    where.push(`timestamp >= (SELECT joined_at FROM room_members WHERE room_id = ? AND user_no = ?)`);
+    params.push(roomId, viewer);
+  }
+  const rows = db
+    .prepare(
+      `SELECT id FROM messages
+       WHERE ${where.join(' AND ')}
+       ORDER BY id DESC
+       LIMIT ?`
+    )
+    .all(...params, size + 1);
+  return {
+    ids: rows.slice(0, size).map((row) => Number(row.id)),
+    truncated: rows.length > size,
   };
 }
 
@@ -995,6 +1111,10 @@ module.exports = {
   toUserNo,
   isAdminNo,
   saveMessage,
+  registerFile,
+  getFile,
+  attachFile,
+  previewTextOf,
   createRoom,
   joinMemberNames,
   getRoom,
@@ -1018,6 +1138,8 @@ module.exports = {
   getRoomHistory,
   getRecentRoomMessages,
   getRoomMessagesPage,
+  getRoomMessagesAround,
+  searchRoomMessages,
   getUserByNo,
   getUserByLoginId,
   isLoginIdTaken,

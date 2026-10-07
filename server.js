@@ -1,9 +1,17 @@
 // WebSocket 채팅 서버 생성
 const WebSocket = require('ws');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
 // SQLite 데이터베이스 (메시지/방 저장/조회) — user_no PK + login_id 체제
 const {
   saveMessage,
+  registerFile,
+  getFile,
+  attachFile,
+  previewTextOf,
   createRoom,
   joinMemberNames,
   getRoom,
@@ -23,6 +31,8 @@ const {
   closeRoomIfEmpty,
   getRoomHistory,
   getRoomMessagesPage,
+  getRoomMessagesAround,
+  searchRoomMessages,
   getUserByNo,
   getUserByLoginId,
   upsertUser,
@@ -48,8 +58,128 @@ const {
 } = require('./db');
 
 // 포트 8080에서 서버 실행 (테스트 시 PORT로 재지정 가능)
+// 같은 포트에서 HTTP(첨부파일 업로드/다운로드)와 WebSocket(채팅)을 함께 받는다.
 const PORT = Number(process.env.PORT) || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+
+// ─── 첨부파일 (HTTP) ───
+//   POST /upload?name=<파일명>   본문 = 파일 바이트, Content-Type = 파일 MIME
+//        → { fileId, name, size, mime }  (이후 room_message { fileId } 로 방에 첨부)
+//   GET  /files/<fileId>[?download=1]  → 파일 바이트 (download=1 이면 attachment)
+// fileId는 추측 불가능한 랜덤 키(128bit)라 URL 자체가 열람 권한 역할을 한다.
+const UPLOAD_DIR = process.env.VIBE_UPLOAD_DIR || path.join(__dirname, 'uploads');
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const FILE_KEY_RE = /^[a-f0-9]{32}$/;
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
+}
+
+// 파일명 정리: 경로 구분자/제어문자 제거, 최대 200자
+function sanitizeFileName(raw) {
+  const name = String(raw ?? '').replace(/[\\/\x00-\x1f]/g, '_').trim().slice(0, 200);
+  return name || 'file';
+}
+
+function handleUpload(req, res, url) {
+  const name = sanitizeFileName(url.searchParams.get('name'));
+  const mime = String(req.headers['content-type'] || '').split(';')[0].trim().slice(0, 100)
+    || 'application/octet-stream';
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+    sendJson(res, 413, { error: 'too_large', maxBytes: MAX_UPLOAD_BYTES });
+    req.resume();
+    return;
+  }
+  const key = crypto.randomBytes(16).toString('hex');
+  const filePath = path.join(UPLOAD_DIR, key);
+  const out = fs.createWriteStream(filePath);
+  let size = 0;
+  let failed = false;
+  const fail = (status, error) => {
+    if (failed) return;
+    failed = true;
+    out.destroy();
+    fs.rm(filePath, { force: true }, () => {});
+    sendJson(res, status, { error, maxBytes: MAX_UPLOAD_BYTES });
+  };
+  req.on('data', (chunk) => {
+    size += chunk.length;
+    if (size > MAX_UPLOAD_BYTES) {
+      fail(413, 'too_large');
+      req.unpipe(out);
+      req.resume();
+    }
+  });
+  req.on('error', () => fail(400, 'upload_failed'));
+  out.on('error', () => fail(500, 'write_failed'));
+  out.on('finish', () => {
+    if (failed) return;
+    if (size === 0) {
+      fail(400, 'empty');
+      return;
+    }
+    try {
+      registerFile({ key, name, size, mime, timestamp: Date.now() });
+    } catch (e) {
+      console.error('첨부파일 등록 실패:', e);
+      fail(500, 'register_failed');
+      return;
+    }
+    console.log(`첨부파일 업로드 ${key} "${name}" (${size} bytes, ${mime})`);
+    sendJson(res, 200, { fileId: key, name, size, mime });
+  });
+  req.pipe(out);
+}
+
+function handleDownload(req, res, key, url) {
+  const file = FILE_KEY_RE.test(key) ? getFile(key) : null;
+  const filePath = file ? path.join(UPLOAD_DIR, file.key) : null;
+  if (!file || !fs.existsSync(filePath)) {
+    sendJson(res, 404, { error: 'not_found' });
+    return;
+  }
+  const disposition = url.searchParams.get('download') === '1' ? 'attachment' : 'inline';
+  res.writeHead(200, {
+    'Content-Type': file.mime,
+    'Content-Length': file.size,
+    'Content-Disposition': `${disposition}; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+    'Cache-Control': 'private, max-age=31536000, immutable',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  fs.createReadStream(filePath).pipe(res);
+}
+
+const server = http.createServer((req, res) => {
+  // 클라이언트(vite dev / tauri webview)는 다른 origin이므로 CORS 허용
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (req.method === 'POST' && url.pathname === '/upload') {
+    handleUpload(req, res, url);
+    return;
+  }
+  const m = url.pathname.match(/^\/files\/([^/]+)$/);
+  if (m && (req.method === 'GET' || req.method === 'HEAD')) {
+    handleDownload(req, res, m[1], url);
+    return;
+  }
+  sendJson(res, 404, { error: 'not_found' });
+});
+
+const wss = new WebSocket.Server({ server });
+server.listen(PORT);
 
 // 클라이언트별 user_no 저장 (WebSocket 인스턴스 -> user_no)
 const clients = new Map();
@@ -118,6 +248,8 @@ function broadcast(message) {
 // 채팅창 히스토리 한 페이지 (msgId 커서) + 안 읽은 수 장식
 // opts: { beforeId, afterId, limit } — 생략 시 최신 페이지
 const HISTORY_PAGE_SIZE = 30;
+// 채팅창 메시지 검색어 최대 길이
+const SEARCH_KEYWORD_MAX = 50;
 function buildRoomHistoryPage(roomId, viewerNo, opts = {}) {
   const page = getRoomMessagesPage(roomId, viewerNo, { limit: HISTORY_PAGE_SIZE, ...opts });
   return {
@@ -473,6 +605,71 @@ wss.on('connection', (ws) => {
         }));
       }
 
+      // ─── 채팅창 메시지 검색: 본문 포함 검색 → 매칭 msgId 목록 (최신 → 과거) ───
+      else if (data.type === 'room_search') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const roomId = Number(data.roomId);
+        if (!Number.isInteger(roomId)) return;
+        const keyword = String(data.keyword ?? '').trim();
+        const room = getRoom(roomId);
+        if (!room || !isMember(roomId, me) || keyword === '' || keyword.length > SEARCH_KEYWORD_MAX) {
+          ws.send(JSON.stringify({ type: 'room_search_result', roomId, keyword, ids: [], truncated: false }));
+          return;
+        }
+        ws.send(JSON.stringify({
+          type: 'room_search_result',
+          roomId,
+          keyword,
+          ...searchRoomMessages(roomId, me, keyword),
+        }));
+      }
+
+      // ─── 검색 결과 점프: msgId 를 가운데 둔 한 페이지 ───
+      else if (data.type === 'room_history_around') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const roomId = Number(data.roomId);
+        const msgId = Number(data.msgId);
+        if (!Number.isInteger(roomId) || !Number.isInteger(msgId) || msgId <= 0) return;
+        const room = getRoom(roomId);
+        if (!room || !isMember(roomId, me)) {
+          ws.send(JSON.stringify({ type: 'history_room_around', roomId, msgId, messages: [], hasMore: false, hasNewer: false }));
+          return;
+        }
+        const page = getRoomMessagesAround(roomId, me, msgId);
+        ws.send(JSON.stringify({
+          type: 'history_room_around',
+          roomId,
+          msgId,
+          hasMore: page.hasMore,
+          hasNewer: page.hasNewer,
+          messages: decorateUnreadCounts('room', String(roomId), page.messages, getRoomMemberNos(roomId)),
+        }));
+      }
+
+      // ─── 점프 후 아래로 스크롤: afterId(가장 최근 msgId)보다 이후 한 페이지 ───
+      else if (data.type === 'room_history_newer') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const roomId = Number(data.roomId);
+        const afterId = Number(data.afterId);
+        if (!Number.isInteger(roomId) || !Number.isInteger(afterId) || afterId <= 0) return;
+        const room = getRoom(roomId);
+        if (!room || !isMember(roomId, me)) {
+          ws.send(JSON.stringify({ type: 'history_room_newer', roomId, afterId, messages: [], hasNewer: false }));
+          return;
+        }
+        const page = buildRoomHistoryPage(roomId, me, { afterId, limit: data.limit });
+        ws.send(JSON.stringify({
+          type: 'history_room_newer',
+          roomId,
+          afterId,
+          messages: page.messages,
+          hasNewer: page.hasMore,
+        }));
+      }
+
       // ─── 번호방: 생성 (초대 멤버 포함 가능) ───
       // 신 규격: { memberNos: number[] } — user_no 기준
       else if (data.type === 'room_create') {
@@ -761,7 +958,17 @@ wss.on('connection', (ws) => {
         if (!my) return;
         const roomId = Number(data.roomId);
         if (!Number.isInteger(roomId)) return;
-        const text = String(data.text || '').trim();
+        // 첨부파일 메시지: 업로드로 받은 fileId(아직 어느 메시지에도 붙지 않은 것)만 허용
+        let file = null;
+        if (data.fileId != null) {
+          const found = getFile(data.fileId);
+          if (!found || found.msgId != null) {
+            ws.send(JSON.stringify({ type: 'system', roomId, text: '첨부파일을 찾을 수 없습니다. 다시 첨부해 주세요.' }));
+            return;
+          }
+          file = found;
+        }
+        const text = file ? file.name : String(data.text || '').trim();
         if (!text) return;
         const room = getRoom(roomId);
         if (!isRoomActive(room)) return;
@@ -772,11 +979,13 @@ wss.on('connection', (ws) => {
           type: 'room_message', roomId,
           from_no: me, from: my.nickname, text: text.slice(0, 2000), timestamp,
         };
-        console.log(`#${roomId} user_no=${me}(${my.nickname}): ${text}`);
+        if (file) payload.file = { id: file.key, name: file.name, size: file.size, mime: file.mime };
+        console.log(`#${roomId} user_no=${me}(${my.nickname}): ${file ? `[첨부] ${text}` : text}`);
         const savedRoom = saveMessage({
           roomType: 'room', senderNo: me, senderName: my.nickname,
-          text: payload.text, timestamp, roomId,
+          text: payload.text, timestamp, roomId, file,
         });
+        if (file) attachFile(file.key, Number(savedRoom?.lastInsertRowid || 0));
         // 저장된 행 id + 읽지 않은 멤버 수를 붙인다.
         // 발신자 본인 화면에서 카톡식 숫자로 표시되고, 상대가 읽으면 나중에 감소한다.
         const roomMsgId = Number(savedRoom?.lastInsertRowid || 0);
@@ -791,7 +1000,7 @@ wss.on('connection', (ws) => {
         // '내 채팅방' 목록의 마지막 메시지/시간 실시간 갱신용 (DB 재조회 없이 가볍게 반영)
         broadcastToRoom(roomId, {
           type: 'room_last_message', roomId,
-          from_no: me, from: my.nickname, text: payload.text, timestamp,
+          from_no: me, from: my.nickname, text: previewTextOf(payload.text, file ? file.mime : null), timestamp,
         });
 
         // 방 멤버(발신자 제외) 안읽은 건수 +1.
