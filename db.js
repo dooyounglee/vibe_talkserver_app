@@ -344,6 +344,8 @@ function decorateUnreadCounts(scope, target, messages, participants) {
 
 try {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, timestamp, id)`);
+  // 커서 페이징(id < ? / id > ?) 전용
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_room_members_no ON room_members(user_no, room_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_room_members_room ON room_members(room_id, user_no)`);
 } catch (e) {
@@ -694,36 +696,56 @@ function getRoomHistory(roomId, limit = 50) {
   }));
 }
 
-// 채팅창 열람용: 방 최근 N건 (기본 10건, 오래된 → 최신 순)
+// 채팅창 열람용 페이지 조회 (msgId 커서 기반, 결과는 항상 오래된 → 최신 순)
+//   - beforeId: 그 id보다 이전 메시지 limit건 (위로 스크롤 시 "이전 대화 더보기")
+//   - afterId : 그 id보다 이후 메시지 limit건 (검색 결과 점프 후 아래로 스크롤용)
+//   - 둘 다 없으면 최신 limit건
 // viewerNo를 주면 "초대받은 시점(room_members.joined_at) 이후"의 메시지만 돌려준다.
-// 두 컬럼 모두 epoch ms라 비교를 그대로 쓸 수 있다. (초대받은 사람은 그 이전 대화를 볼 수 없다)
-function getRecentRoomMessages(roomId, limit = 10, viewerNo = null) {
+// messages.id는 AUTOINCREMENT로 단조 증가하므로 id 순서 = 저장 순서다.
+// limit+1건을 읽어 hasMore(해당 방향으로 더 있는지)를 판정한다.
+const MAX_PAGE_LIMIT = 50;
+function getRoomMessagesPage(roomId, viewerNo = null, { beforeId = null, afterId = null, limit = 30 } = {}) {
   const viewer = toUserNo(viewerNo);
-  const rows = viewer
-    ? db
-        .prepare(
-          `SELECT id, sender_no, sender_name, text, timestamp FROM messages
-           WHERE room_type = 'room' AND room_id = ?
-             AND timestamp >= (SELECT joined_at FROM room_members WHERE room_id = ? AND user_no = ?)
-           ORDER BY timestamp DESC, id DESC
-           LIMIT ?`
-        )
-        .all(roomId, roomId, viewer, limit)
-    : db
-        .prepare(
-          `SELECT id, sender_no, sender_name, text, timestamp FROM messages
-           WHERE room_type = 'room' AND room_id = ?
-           ORDER BY timestamp DESC, id DESC
-           LIMIT ?`
-        )
-        .all(roomId, limit);
-  return rows.reverse().map((row) => ({
-    id: Number(row.id),
-    user_no: Number(row.sender_no),
-    nickname: String(row.sender_name ?? ''),
-    text: row.text,
-    timestamp: row.timestamp,
-  }));
+  const size = Math.min(Math.max(Number.parseInt(limit, 10) || 30, 1), MAX_PAGE_LIMIT);
+  const before = toUserNo(beforeId);
+  const after = before ? null : toUserNo(afterId);
+
+  const where = [`room_type = 'room'`, `room_id = ?`];
+  const params = [roomId];
+  if (viewer) {
+    where.push(`timestamp >= (SELECT joined_at FROM room_members WHERE room_id = ? AND user_no = ?)`);
+    params.push(roomId, viewer);
+  }
+  if (before) { where.push(`id < ?`); params.push(before); }
+  if (after) { where.push(`id > ?`); params.push(after); }
+  const order = after ? 'ASC' : 'DESC';
+
+  const rows = db
+    .prepare(
+      `SELECT id, sender_no, sender_name, text, timestamp FROM messages
+       WHERE ${where.join(' AND ')}
+       ORDER BY id ${order}
+       LIMIT ?`
+    )
+    .all(...params, size + 1);
+  const hasMore = rows.length > size;
+  const page = rows.slice(0, size);
+  if (!after) page.reverse();
+  return {
+    hasMore,
+    messages: page.map((row) => ({
+      id: Number(row.id),
+      user_no: Number(row.sender_no),
+      nickname: String(row.sender_name ?? ''),
+      text: row.text,
+      timestamp: row.timestamp,
+    })),
+  };
+}
+
+// 채팅창 열람용: 방 최근 N건 (오래된 → 최신 순) — getRoomMessagesPage의 최신 페이지
+function getRecentRoomMessages(roomId, limit = 10, viewerNo = null) {
+  return getRoomMessagesPage(roomId, viewerNo, { limit }).messages;
 }
 
 // ─── 등록 사용자 (users) ───
@@ -995,6 +1017,7 @@ module.exports = {
   closeRoomIfEmpty,
   getRoomHistory,
   getRecentRoomMessages,
+  getRoomMessagesPage,
   getUserByNo,
   getUserByLoginId,
   isLoginIdTaken,

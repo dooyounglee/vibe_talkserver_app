@@ -22,7 +22,7 @@ const {
   softDeleteRoom,
   closeRoomIfEmpty,
   getRoomHistory,
-  getRecentRoomMessages,
+  getRoomMessagesPage,
   getUserByNo,
   getUserByLoginId,
   upsertUser,
@@ -115,6 +115,17 @@ function broadcast(message) {
 }
 
 // 특정 방 멤버에게만 메시지 발송 (권한 판정은 항상 DB 기준)
+// 채팅창 히스토리 한 페이지 (msgId 커서) + 안 읽은 수 장식
+// opts: { beforeId, afterId, limit } — 생략 시 최신 페이지
+const HISTORY_PAGE_SIZE = 30;
+function buildRoomHistoryPage(roomId, viewerNo, opts = {}) {
+  const page = getRoomMessagesPage(roomId, viewerNo, { limit: HISTORY_PAGE_SIZE, ...opts });
+  return {
+    hasMore: page.hasMore,
+    messages: decorateUnreadCounts('room', String(roomId), page.messages, getRoomMemberNos(roomId)),
+  };
+}
+
 function broadcastToRoom(roomId, message) {
   const payload = JSON.stringify(message);
   wss.clients.forEach(client => {
@@ -421,7 +432,7 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // ─── 채팅창 열람: 번호방 최근 10건 조회 (창이 열릴 때마다 요청) ───
+      // ─── 채팅창 열람: 번호방 최근 한 페이지 조회 (창이 열릴 때마다 요청) ───
       else if (data.type === 'room_history') {
         const me = myUserNo(ws);
         if (!me) return;
@@ -430,7 +441,7 @@ wss.on('connection', (ws) => {
         const room = getRoom(roomId);
         // 존재하지 않는 방/멤버가 아닌 방은 빈 히스토리로 응답 (누출 방지)
         if (!room || !isMember(roomId, me)) {
-          ws.send(JSON.stringify({ type: 'history_room', roomId, messages: [] }));
+          ws.send(JSON.stringify({ type: 'history_room', roomId, messages: [], hasMore: false }));
           return;
         }
         ws.send(JSON.stringify({
@@ -438,12 +449,27 @@ wss.on('connection', (ws) => {
           roomId,
           members: getRoomMemberNos(roomId),
           memberProfiles: getRoomMembers(roomId),
-          messages: decorateUnreadCounts(
-            'room',
-            String(roomId),
-            getRecentRoomMessages(roomId, 10, me),
-            getRoomMemberNos(roomId),
-          ),
+          ...buildRoomHistoryPage(roomId, me),
+        }));
+      }
+
+      // ─── 채팅창 이전 대화 더보기: beforeId(가장 오래된 msgId)보다 이전 한 페이지 ───
+      else if (data.type === 'room_history_older') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const roomId = Number(data.roomId);
+        const beforeId = Number(data.beforeId);
+        if (!Number.isInteger(roomId) || !Number.isInteger(beforeId) || beforeId <= 0) return;
+        const room = getRoom(roomId);
+        if (!room || !isMember(roomId, me)) {
+          ws.send(JSON.stringify({ type: 'history_room_older', roomId, beforeId, messages: [], hasMore: false }));
+          return;
+        }
+        ws.send(JSON.stringify({
+          type: 'history_room_older',
+          roomId,
+          beforeId,
+          ...buildRoomHistoryPage(roomId, me, { beforeId, limit: data.limit }),
         }));
       }
 
@@ -574,12 +600,7 @@ wss.on('connection', (ws) => {
               roomId,
               members: roomMemberNos,
               memberProfiles,
-              messages: decorateUnreadCounts(
-                'room',
-                String(roomId),
-                getRecentRoomMessages(roomId, 10, no),
-                roomMemberNos,
-              ),
+              ...buildRoomHistoryPage(roomId, no),
             }));
           }
         });
@@ -619,12 +640,7 @@ wss.on('connection', (ws) => {
           roomId,
           members: getRoomMemberNos(roomId),
           memberProfiles: getRoomMembers(roomId),
-          messages: decorateUnreadCounts(
-            'room',
-            String(roomId),
-            getRecentRoomMessages(roomId, 10, me),
-            getRoomMemberNos(roomId),
-          ),
+          ...buildRoomHistoryPage(roomId, me),
         }));
         ws.send(JSON.stringify({ type: 'my_rooms', rooms: getMyRooms(me) }));
         broadcastToRoom(roomId, {

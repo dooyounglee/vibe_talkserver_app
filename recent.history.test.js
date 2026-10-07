@@ -112,6 +112,37 @@ try {
   assert(dbm.getRecentRoomMessages(carolRoom, 10).length === 1, '다른 1:1방은 1건');
   assert(dbm.getRecentRoomMessages(9999, 10).length === 0, '없는 방은 빈 배열');
 
+  // ─── 커서 페이징 (getRoomMessagesPage) ───
+  // roomId 방: msg-0 ~ msg-14 (15건)
+  const latest = dbm.getRoomMessagesPage(roomId, null, { limit: 6 });
+  assert(latest.messages.length === 6 && latest.messages[5].text === 'msg-14', '최신 페이지 6건, msg-14로 끝남');
+  assert(latest.hasMore === true, '최신 페이지 이후 이전 대화 있음');
+  const p2 = dbm.getRoomMessagesPage(roomId, null, { beforeId: latest.messages[0].id, limit: 6 });
+  assert(p2.messages[0].text === 'msg-3' && p2.messages[5].text === 'msg-8', '이전 페이지 msg-3 ~ msg-8');
+  assert(p2.hasMore === true, '아직 더 이전 대화 있음');
+  const p3 = dbm.getRoomMessagesPage(roomId, null, { beforeId: p2.messages[0].id, limit: 6 });
+  assert(p3.messages.length === 3 && p3.messages[0].text === 'msg-0', '마지막 페이지는 남은 3건');
+  assert(p3.hasMore === false, '마지막 페이지는 hasMore=false');
+  const seen = [...p3.messages, ...p2.messages, ...latest.messages].map((m) => m.text);
+  assert(
+    seen.length === 15 && new Set(seen).size === 15 && seen.every((t, i) => t === `msg-${i}`),
+    '페이지를 이어 붙이면 빠짐/중복 없이 전체 순서 일치'
+  );
+  const fwd = dbm.getRoomMessagesPage(roomId, null, { afterId: p3.messages[2].id, limit: 4 });
+  assert(fwd.messages[0].text === 'msg-3' && fwd.messages[3].text === 'msg-6', 'afterId: 이후 4건 (오래된 → 최신)');
+  assert(fwd.hasMore === true, 'afterId: 더 이후 대화 있음');
+  assert(dbm.getRoomMessagesPage(roomId, null, { limit: 999 }).messages.length === 15, 'limit 상한(50) 내에서 전체');
+
+  // 초대 시점(joined_at) 이전 메시지는 페이징으로도 볼 수 없다
+  dbm.addMember(roomId, carolNo, now + 2 + 10); // msg-10(timestamp now+12) 부터 볼 수 있음
+  const carolLatest = dbm.getRoomMessagesPage(roomId, carolNo, { limit: 3 });
+  assert(carolLatest.messages[2].text === 'msg-14' && carolLatest.hasMore === true, '초대된 사용자 최신 페이지');
+  const carolOlder = dbm.getRoomMessagesPage(roomId, carolNo, { beforeId: carolLatest.messages[0].id, limit: 10 });
+  assert(
+    carolOlder.messages.length === 2 && carolOlder.messages[0].text === 'msg-10' && carolOlder.hasMore === false,
+    '초대 이전 메시지(msg-0 ~ msg-9)는 이전 페이지에서도 제외'
+  );
+
   console.log('\nALL RECENT HISTORY TESTS PASSED');
   cleanup();
 } catch (e) {

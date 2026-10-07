@@ -97,39 +97,63 @@ const connect = (loginId) => new Promise((resolve, reject) => {
     a.inbox.length = 0;
     a.send({ type: 'room_history', roomId: dmRoomId });
     const dmHist = await a.waitFor((m) => m.type === 'history_room' && m.roomId === dmRoomId);
-    assert(dmHist.messages.length === 10, '1:1방 최근 10건 응답');
-    assert(dmHist.messages[0].text === 'dm-5', '가장 최근 10건의 시작점이 dm-5');
-    assert(dmHist.messages[9].text === 'dm-14', '최신 dm-14로 끝남');
+    assert(dmHist.messages.length === 15, '1:1방 히스토리: 한 페이지(30) 이하면 전부 응답');
+    assert(dmHist.messages[0].text === 'dm-0', '가장 오래된 dm-0부터 시작');
+    assert(dmHist.messages[14].text === 'dm-14', '최신 dm-14로 끝남');
+    assert(dmHist.hasMore === false, '더 이전 대화 없음(hasMore=false)');
 
     // 상대(root)도 같은 1:1방 히스토리를 본다
     b.inbox.length = 0;
     b.send({ type: 'room_history', roomId: dmRoomId });
     const dmHistB = await b.waitFor((m) => m.type === 'history_room' && m.roomId === dmRoomId);
-    assert(dmHistB.messages.length === 10 && dmHistB.messages[9].text === 'dm-14', '상대도 1:1방 최근 10건 조회');
+    assert(dmHistB.messages.length === 15 && dmHistB.messages[14].text === 'dm-14', '상대도 1:1방 히스토리 조회');
 
-    // 3. 번호방 생성 + 메시지 15건 → room_history로 최근 10건
+    // 3. 번호방 생성 + 메시지 40건 → room_history로 최근 30건, room_history_older로 나머지 10건
     a.inbox.length = 0;
     a.send({ type: 'room_create', memberNos: [rootNo] });
     const created = await a.waitFor((m) => m.type === 'room_created');
     const roomId = created.roomId;
     b.send({ type: 'room_join', roomId });
     await wait(200);
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 40; i++) {
       a.send({ type: 'room_message', roomId, text: `room-${i}` });
     }
     await wait(400);
     b.inbox.length = 0;
     b.send({ type: 'room_history', roomId });
     const roomHist = await b.waitFor((m) => m.type === 'history_room' && m.roomId === roomId);
-    assert(roomHist.messages.length === 10, 'room_history 응답이 10건');
-    assert(roomHist.messages[0].text === 'room-5', '가장 최근 10건의 시작점이 room-5');
-    assert(roomHist.messages[9].text === 'room-14', '최신 room-14로 끝남');
+    assert(roomHist.messages.length === 30, 'room_history 응답이 30건');
+    assert(roomHist.messages[0].text === 'room-10', '가장 최근 30건의 시작점이 room-10');
+    assert(roomHist.messages[29].text === 'room-39', '최신 room-39로 끝남');
+    assert(roomHist.hasMore === true, '이전 대화 있음(hasMore=true)');
+
+    // 3-1. 이전 대화 더보기: 가장 오래된 msgId 이전 페이지
+    b.inbox.length = 0;
+    const oldestId = roomHist.messages[0].msgId;
+    b.send({ type: 'room_history_older', roomId, beforeId: oldestId });
+    const older = await b.waitFor((m) => m.type === 'history_room_older' && m.roomId === roomId);
+    assert(older.beforeId === oldestId, 'history_room_older에 요청한 beforeId 포함');
+    assert(older.messages.length === 10, '이전 페이지는 남은 10건');
+    assert(older.messages[0].text === 'room-0' && older.messages[9].text === 'room-9', '이전 페이지 room-0 ~ room-9 (오래된 → 최신)');
+    assert(older.messages.every((m) => m.msgId < oldestId), '이전 페이지는 모두 beforeId보다 작은 msgId');
+    assert(older.hasMore === false, '더 이전 대화 없음(hasMore=false)');
+
+    // 3-2. limit 지정
+    b.inbox.length = 0;
+    b.send({ type: 'room_history_older', roomId, beforeId: oldestId, limit: 4 });
+    const olderSmall = await b.waitFor((m) => m.type === 'history_room_older' && m.roomId === roomId);
+    assert(olderSmall.messages.length === 4 && olderSmall.messages[3].text === 'room-9', 'limit 지정 시 그 개수만');
+    assert(olderSmall.hasMore === true, 'limit 이후 남은 대화 있음(hasMore=true)');
 
     // 4. 멤버가 아니면 빈 히스토리 (누출 방지)
     a.inbox.length = 0;
     a.send({ type: 'room_history', roomId: 999999 });
     const missing = await a.waitFor((m) => m.type === 'history_room' && m.roomId === 999999);
     assert(Array.isArray(missing.messages) && missing.messages.length === 0, '없는 방은 빈 히스토리');
+    a.inbox.length = 0;
+    a.send({ type: 'room_history_older', roomId: 999999, beforeId: 100 });
+    const missingOlder = await a.waitFor((m) => m.type === 'history_room_older' && m.roomId === 999999);
+    assert(missingOlder.messages.length === 0 && missingOlder.hasMore === false, '없는 방은 이전 대화도 빈 응답');
 
     // 5. 1:1방은 한 번 확보되면 같은 방이 재사용된다 (중복방 생성 방지)
     a.inbox.length = 0;
