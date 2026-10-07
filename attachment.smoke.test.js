@@ -20,7 +20,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const connect = (loginId) => new Promise((resolve, reject) => {
   const ws = new WebSocket(WS_URL);
   const inbox = [];
-  ws.on('open', () => ws.send(JSON.stringify({ type: 'join', loginId })));
+  ws.on('open', () => ws.send(JSON.stringify({ type: 'join', loginId, password: loginId })));
   ws.on('message', (raw) => { try { inbox.push(JSON.parse(String(raw))); } catch { /* 무시 */ } });
   ws.on('error', reject);
   const waitFor = (pred, timeout = 5000) => new Promise((res, rej) => {

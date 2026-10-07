@@ -38,6 +38,9 @@ const {
   getUserByLoginId,
   upsertUser,
   renameUser,
+  verifyUserPassword,
+  changePassword,
+  resetPassword,
   setUserProfileImage,
   isWithdrawnByNo,
   isRegisteredNo,
@@ -380,6 +383,10 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'join_failed', reason: 'not_registered', text: '등록된 사용자가 아닙니다. 관리자에게 문의하세요' }));
           return;
         }
+        if (!verifyUserPassword(user.user_no, String(data.password ?? ''))) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'wrong_password', text: '비밀번호가 올바르지 않습니다.' }));
+          return;
+        }
         if (user.isDeleted) {
           ws.send(JSON.stringify({ type: 'join_failed', reason: 'withdrawn', text: '탈퇴한 사용자입니다' }));
           return;
@@ -520,6 +527,52 @@ wss.on('connection', (ws) => {
         }
       }
       
+      // ─── 비밀번호 변경 (본인) ───
+      // { currentPassword, newPassword } — 새 비밀번호는 8~50자 영문+숫자 조합
+      else if (data.type === 'password_change') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const result = changePassword({
+          userNo: me,
+          currentPassword: String(data.currentPassword ?? ''),
+          newPassword: String(data.newPassword ?? ''),
+        });
+        if (!result.ok) {
+          const texts = {
+            not_found: '사용자를 찾을 수 없습니다.',
+            wrong_current: '현재 비밀번호가 올바르지 않습니다.',
+            invalid_new: '새 비밀번호는 영문과 숫자를 포함해 8~50자로 입력하세요.',
+            same_as_current: '현재 비밀번호와 다른 비밀번호를 입력하세요.',
+          };
+          ws.send(JSON.stringify({ type: 'password_change_result', ok: false, reason: result.reason, text: texts[result.reason] || '비밀번호 변경에 실패했습니다' }));
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'password_change_result', ok: true }));
+      }
+
+      // ─── 비밀번호 초기화 (본인 + admin) ───
+      // { targetUserNo? } 생략 시 본인. 아이디 + 전화번호 뒤 4자리로 되돌린다.
+      // 새 비밀번호 값은 본인 초기화일 때만 돌려준다 (저장된 로그인 정보 갱신용).
+      else if (data.type === 'password_reset') {
+        const me = myUserNo(ws);
+        if (!me) return;
+        const result = resetPassword({ targetNo: data.targetUserNo ?? me, requesterNo: me });
+        if (!result.ok) {
+          const texts = {
+            invalid_user: '대상 사용자가 올바르지 않습니다.',
+            forbidden: '본인의 비밀번호만 초기화할 수 있습니다.',
+            not_found: '사용자를 찾을 수 없습니다.',
+          };
+          ws.send(JSON.stringify({ type: 'password_reset_result', ok: false, reason: result.reason, text: texts[result.reason] || '비밀번호 초기화에 실패했습니다' }));
+          return;
+        }
+        const self = Number(result.user_no) === Number(me);
+        ws.send(JSON.stringify({
+          type: 'password_reset_result', ok: true, user_no: result.user_no, self,
+          ...(self ? { password: result.password } : {}),
+        }));
+      }
+
       // ─── 프로필 이미지 변경/초기화 (본인) ───
       // { fileId } = POST /upload 로 올린 이미지 파일 키, { fileId: null } = 기본 이미지로 초기화
       else if (data.type === 'profile_image_set') {

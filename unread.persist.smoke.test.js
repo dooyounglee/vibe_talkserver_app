@@ -30,7 +30,7 @@ const connect = (loginId) =>
     const ws = new WebSocket(WS_URL);
     const inbox = [];
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', loginId }));
+      ws.send(JSON.stringify({ type: 'join', loginId, password: loginId }));
     });
     ws.on('message', (raw) => {
       try { inbox.push(JSON.parse(String(raw))); } catch { /* 무시 */ }

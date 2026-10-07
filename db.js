@@ -1,5 +1,6 @@
 // SQLite 데이터베이스 초기화 (better-sqlite3) — user_no PK + login_id 체제 (fresh)
 const path = require('path');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 // 프로젝트 루트의 chat.db 파일 사용 (없으면 자동 생성)
@@ -109,6 +110,13 @@ try {
   /* duplicate column — 이미 추가됨 */
 }
 
+// 기존 chat.db 호환: users.password_hash 컬럼 추가 (scrypt 해시, 평문 저장 안 함)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT NULL`);
+} catch {
+  /* duplicate column — 이미 추가됨 */
+}
+
 // ─── 첨부파일 ───
 // 업로드(HTTP POST /upload)된 파일 등록부. file_key는 추측 불가능한 랜덤 키이며
 // 다운로드 URL(/files/:key)에 그대로 쓰인다. 메시지에 첨부되면 msg_id가 채워진다.
@@ -140,6 +148,37 @@ try {
   ).run(Date.now());
 } catch (e) {
   console.error('admin 시드 실패:', e);
+}
+
+// ─── 비밀번호 ───
+// 저장: scrypt$<salt hex>$<hash hex>. 초기값/초기화값 = 아이디 + 전화번호 숫자 뒤 4자리
+// (전화번호 숫자가 4자리 미만이면 아이디만).
+function hashPassword(plain) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(plain), salt, 32);
+  return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+function verifyPasswordHash(plain, stored) {
+  const parts = String(stored ?? '').split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+  const salt = Buffer.from(parts[1], 'hex');
+  const expected = Buffer.from(parts[2], 'hex');
+  const actual = crypto.scryptSync(String(plain ?? ''), salt, expected.length);
+  return crypto.timingSafeEqual(actual, expected);
+}
+function defaultPasswordOf(loginId, phone) {
+  const digits = String(phone ?? '').replace(/\D/g, '');
+  return String(loginId ?? '') + (digits.length >= 4 ? digits.slice(-4) : '');
+}
+// 비밀번호가 없는 기존 사용자(admin 포함)는 초기값으로 채운다
+try {
+  const rows = db.prepare(`SELECT user_no, login_id, phone FROM users WHERE password_hash IS NULL`).all();
+  const upd = db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`);
+  db.transaction(() => {
+    for (const r of rows) upd.run(hashPassword(defaultPasswordOf(r.login_id, r.phone)), r.user_no);
+  })();
+} catch (e) {
+  console.error('비밀번호 초기값 설정 실패:', e);
 }
 
 // ─── 안읽은 건수 (unread) ───
@@ -977,9 +1016,9 @@ function upsertUser({ loginId, nickname, phone = null, userName = null, timestam
     if (isNicknameTaken(nick)) return { ok: false, reason: 'nickname_taken' };
     try {
       const info = db.prepare(
-        `INSERT INTO users (login_id, nickname, phone, user_name, created_at, is_deleted, deleted_at, dept_no)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, nick, phoneVal, nameVal, ts, deleted, deleted === 1 ? ts : null, deptVal);
+        `INSERT INTO users (login_id, nickname, phone, user_name, created_at, is_deleted, deleted_at, dept_no, password_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(id, nick, phoneVal, nameVal, ts, deleted, deleted === 1 ? ts : null, deptVal, hashPassword(defaultPasswordOf(id, phoneVal)));
       return { ok: true, user_no: Number(info.lastInsertRowid) };
     } catch (e) {
       if (isLoginIdTaken(id)) return { ok: false, reason: 'login_id_taken' };
@@ -1111,6 +1150,44 @@ function renameUser({ targetNo, newNickname, requesterNo }) {
   return { ok: true, user_no: target };
 }
 
+// 로그인 비밀번호 확인
+function verifyUserPassword(userNo, password) {
+  const no = toUserNo(userNo);
+  if (!no) return false;
+  const row = db.prepare(`SELECT password_hash FROM users WHERE user_no = ?`).get(no);
+  return !!row && verifyPasswordHash(password, row.password_hash);
+}
+
+// 새 비밀번호 규칙: 8~50자, 영문+숫자 각 1자 이상
+function isValidNewPassword(v) {
+  const s = String(v ?? '');
+  return s.length >= 8 && s.length <= 50 && /[A-Za-z]/.test(s) && /\d/.test(s);
+}
+
+// 비밀번호 변경: 본인만, 현재 비밀번호 확인 필수
+function changePassword({ userNo, currentPassword, newPassword }) {
+  const no = toUserNo(userNo);
+  if (!no || !getUserByNo(no)) return { ok: false, reason: 'not_found' };
+  if (!verifyUserPassword(no, currentPassword)) return { ok: false, reason: 'wrong_current' };
+  if (!isValidNewPassword(newPassword)) return { ok: false, reason: 'invalid_new' };
+  if (String(newPassword) === String(currentPassword)) return { ok: false, reason: 'same_as_current' };
+  db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`).run(hashPassword(newPassword), no);
+  return { ok: true, user_no: no };
+}
+
+// 비밀번호 초기화: 본인 또는 admin(user_no=1). 아이디 + 전화번호 뒤 4자리로 되돌린다.
+function resetPassword({ targetNo, requesterNo }) {
+  const target = toUserNo(targetNo);
+  const requester = toUserNo(requesterNo);
+  if (!target || !requester) return { ok: false, reason: 'invalid_user' };
+  if (requester !== target && !isAdminNo(requester)) return { ok: false, reason: 'forbidden' };
+  const row = getUserByNo(target);
+  if (!row) return { ok: false, reason: 'not_found' };
+  const plain = defaultPasswordOf(row.loginId, row.phone);
+  db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`).run(hashPassword(plain), target);
+  return { ok: true, user_no: target, password: plain };
+}
+
 function withdrawUser(userNo, timestamp) {
   const no = toUserNo(userNo);
   if (!no || no === 1) return;
@@ -1198,6 +1275,9 @@ module.exports = {
   isNicknameTaken,
   upsertUser,
   renameUser,
+  verifyUserPassword,
+  changePassword,
+  resetPassword,
   setUserProfileImage,
   withdrawUser,
   isWithdrawnByNo,
