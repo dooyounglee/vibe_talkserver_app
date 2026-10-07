@@ -650,22 +650,41 @@ function countMembers(roomId) {
   return row ? Number(row.cnt) : 0;
 }
 
-// 방 멤버: [{user_no, nickname(현재), joined_at}] — 표시는 JOIN resolve, 방제는 display_name 스냅샷 유지
+// 방 멤버: [{user_no, nickname(현재), joined_at, profileImage}] — 표시는 JOIN resolve, 방제는 display_name 스냅샷 유지
+// profileImage: 채팅창에서 상대 메시지 옆 프로필 사진 표시용 (없으면 null = 기본 이미지)
 function getRoomMembers(roomId) {
   return db
     .prepare(
-      `SELECT m.user_no AS user_no, u.nickname AS nickname, m.joined_at AS joined_at
+      `SELECT m.user_no AS user_no, u.nickname AS nickname, m.joined_at AS joined_at, u.profile_file_key AS profile_file_key
        FROM room_members m
        LEFT JOIN users u ON u.user_no = m.user_no
        WHERE m.room_id = ? ORDER BY m.joined_at ASC, m.rowid ASC`
     )
     .all(roomId)
-    .map((r) => ({ user_no: Number(r.user_no), nickname: r.nickname != null ? String(r.nickname) : '', joined_at: Number(r.joined_at) || 0 }));
+    .map((r) => ({
+      user_no: Number(r.user_no),
+      nickname: r.nickname != null ? String(r.nickname) : '',
+      joined_at: Number(r.joined_at) || 0,
+      profileImage: profileImageOf(r.profile_file_key),
+    }));
 }
 
 // 멤버 user_no만 필요할 때 (읽음 계산 등)
 function getRoomMemberNos(roomId) {
-  return getRoomMembers(roomId).map((m) => m.user_no);
+  return db
+    .prepare(`SELECT user_no FROM room_members WHERE room_id = ? ORDER BY joined_at ASC, rowid ASC`)
+    .all(roomId)
+    .map((r) => Number(r.user_no));
+}
+
+// 이 사용자가 속한 방 번호 목록 (프로필 변경 시 같은 방 멤버에게 갱신을 알릴 때)
+function getRoomIdsOfUser(userNo) {
+  const no = toUserNo(userNo);
+  if (!no) return [];
+  return db
+    .prepare(`SELECT room_id FROM room_members WHERE user_no = ?`)
+    .all(no)
+    .map((r) => Number(r.room_id));
 }
 
 function getEarliestMemberExcept(roomId, exceptNo) {
@@ -1115,14 +1134,14 @@ function isRegisteredNo(userNo) {
 
 function getAllUsers() {
   return db
-    .prepare(`SELECT user_no, nickname FROM users WHERE is_deleted = 0 ORDER BY nickname ASC`)
+    .prepare(`SELECT user_no, nickname, profile_file_key FROM users WHERE is_deleted = 0 ORDER BY nickname ASC`)
     .all()
-    .map((r) => ({ user_no: Number(r.user_no), nickname: String(r.nickname) }));
+    .map((r) => ({ user_no: Number(r.user_no), nickname: String(r.nickname), profileImage: profileImageOf(r.profile_file_key) }));
 }
 
 function getAllUsersDetail() {
   return db
-    .prepare(`SELECT user_no, login_id, nickname, phone, user_name, is_deleted, dept_no FROM users ORDER BY nickname ASC`)
+    .prepare(`SELECT user_no, login_id, nickname, phone, user_name, is_deleted, dept_no, profile_file_key FROM users ORDER BY nickname ASC`)
     .all()
     .map((r) => ({
       user_no: Number(r.user_no),
@@ -1132,6 +1151,7 @@ function getAllUsersDetail() {
       userName: r.user_name == null ? null : String(r.user_name),
       isDeleted: Number(r.is_deleted) === 1,
       deptNo: r.dept_no == null ? null : Number(r.dept_no),
+      profileImage: profileImageOf(r.profile_file_key),
     }));
 }
 
@@ -1159,6 +1179,7 @@ module.exports = {
   countMembers,
   getRoomMembers,
   getRoomMemberNos,
+  getRoomIdsOfUser,
   getEarliestMemberExcept,
   transferOwner,
   getMyRooms,

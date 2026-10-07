@@ -23,6 +23,7 @@ const {
   removeMember,
   getRoomMembers,
   getRoomMemberNos,
+  getRoomIdsOfUser,
   getEarliestMemberExcept,
   transferOwner,
   getMyRooms,
@@ -304,7 +305,7 @@ function broadcastReadAck(scope, target) {
 }
 
 // 등록된 전체 사용자 목록 + 현재 접속중 목록 + 사용자별 상태를 전체 클라이언트에게 전송
-// users: [{user_no, nickname}], onlineUsers: [user_no], userStatuses: {user_no: status}
+// users: [{user_no, nickname, profileImage}], onlineUsers: [user_no], userStatuses: {user_no: status}
 // admin 접속자에게는 탈퇴 포함 상세(usersDetail)도 개별 전송
 function broadcastUserList() {
   const onlineUsers = Array.from(clients.values()).map((v) => Number(v)).filter((n) => Number.isInteger(n));
@@ -537,6 +538,14 @@ wss.on('connection', (ws) => {
           if (client.readyState !== WebSocket.OPEN) continue;
           client.send(JSON.stringify({ type: 'my_profile', user_no: updated.user_no, loginId: updated.loginId, nickname: updated.nickname, profileImage: updated.profileImage }));
         }
+        // 같은 방 멤버들의 채팅창에서 내 메시지 옆 프로필 사진이 바뀌도록 참여자 목록을 다시 보낸다
+        for (const roomId of getRoomIdsOfUser(me)) {
+          broadcastToRoom(roomId, {
+            type: 'room_members', roomId, members: getRoomMemberNos(roomId), memberProfiles: getRoomMembers(roomId),
+          });
+        }
+        // '사용자' 탭 목록·초대 모달의 프로필 사진도 갱신
+        broadcastUserList();
       }
 
       // ─── 1:1 대화방 확보: '사용자' 탭에서 상대를 눌러 1:1 창을 열 때 ───
