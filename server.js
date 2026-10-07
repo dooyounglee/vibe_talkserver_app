@@ -307,14 +307,25 @@ function broadcastReadAck(scope, target) {
 // 등록된 전체 사용자 목록 + 현재 접속중 목록 + 사용자별 상태를 전체 클라이언트에게 전송
 // users: [{user_no, nickname, profileImage}], onlineUsers: [user_no], userStatuses: {user_no: status}
 // admin 접속자에게는 탈퇴 포함 상세(usersDetail)도 개별 전송
+// 일반 사용자에게는 admin(user_no=1)을 목록/접속/상태에서 모두 뺀 버전을 보낸다
 function broadcastUserList() {
   const onlineUsers = Array.from(clients.values()).map((v) => Number(v)).filter((n) => Number.isInteger(n));
   const users = getAllUsers();
-  broadcast({
+  const userStatuses = buildUserStatuses();
+  const fullPayload = JSON.stringify({ type: "userlist", users, onlineUsers, userStatuses });
+  const statusesNoAdmin = { ...userStatuses };
+  for (const key of Object.keys(statusesNoAdmin)) {
+    if (isAdminNo(Number(key))) delete statusesNoAdmin[key];
+  }
+  const publicPayload = JSON.stringify({
     type: "userlist",
-    users,
-    onlineUsers,
-    userStatuses: buildUserStatuses(),
+    users: users.filter((u) => !isAdminNo(u.user_no)),
+    onlineUsers: onlineUsers.filter((n) => !isAdminNo(n)),
+    userStatuses: statusesNoAdmin,
+  });
+  wss.clients.forEach((client) => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    client.send(isAdminNo(myUserNo(client)) ? fullPayload : publicPayload);
   });
   // admin에게는 전체(탈퇴 포함) 상세 목록 추가 전송
   try {
