@@ -116,6 +116,15 @@ try {
 } catch {
   /* duplicate column — 이미 추가됨 */
 }
+// must_change_password: 1이면 다음 로그인 때 비밀번호 변경 강제 (신규 등록 / 초기화 직후)
+// prev_password_hash: 초기화 직전 비밀번호 — 강제 변경 시 이 값으로 되돌리지 못하게 한다
+for (const col of ['must_change_password INTEGER NOT NULL DEFAULT 0', 'prev_password_hash TEXT NULL']) {
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN ${col}`);
+  } catch {
+    /* duplicate column — 이미 추가됨 */
+  }
+}
 
 // ─── 첨부파일 ───
 // 업로드(HTTP POST /upload)된 파일 등록부. file_key는 추측 불가능한 랜덤 키이며
@@ -166,11 +175,24 @@ function verifyPasswordHash(plain, stored) {
   const actual = crypto.scryptSync(String(plain ?? ''), salt, expected.length);
   return crypto.timingSafeEqual(actual, expected);
 }
+const DUMMY_PASSWORD_HASH = hashPassword(crypto.randomBytes(16).toString('hex'));
+// 전화번호: 0으로 시작, 숫자 9~11자리, 하이픈 선택(쓰면 자리까지 맞아야 함) (02 지역번호는 9~10자리, 그 외 10~11자리)
+// 유효하면 하이픈 형식(010-1234-5678 / 02-123-4567)으로 맞춰 돌려주고, 아니면 null
+function normalizePhone(v) {
+  const raw = String(v ?? '').trim();
+  // 하이픈을 쓰면 위치까지 맞아야 한다 (010-1234-5678 / 02-123-4567)
+  if (!/^\d+$/.test(raw) && !/^0\d{1,2}-\d{3,4}-\d{4}$/.test(raw)) return null;
+  const digits = raw.replace(/-/g, '');
+  const area = digits.startsWith('02') ? 2 : 3;
+  const ok = area === 2 ? /^02\d{7,8}$/.test(digits) : /^0\d{9,10}$/.test(digits);
+  if (!ok) return null;
+  return `${digits.slice(0, area)}-${digits.slice(area, -4)}-${digits.slice(-4)}`;
+}
 function defaultPasswordOf(loginId, phone) {
   const digits = String(phone ?? '').replace(/\D/g, '');
   return String(loginId ?? '') + (digits.length >= 4 ? digits.slice(-4) : '');
 }
-// 비밀번호가 없는 기존 사용자(admin 포함)는 초기값으로 채운다
+// 비밀번호가 없는 기존 사용자(admin 포함)는 초기값으로 채운다 (변경 강제 대상 아님)
 try {
   const rows = db.prepare(`SELECT user_no, login_id, phone FROM users WHERE password_hash IS NULL`).all();
   const upd = db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`);
@@ -1000,7 +1022,9 @@ function upsertUser({ loginId, nickname, phone = null, userName = null, timestam
   const ts = Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now();
   const deleted = isDeleted ? 1 : 0;
   const existing = getUserByLoginId(id);
-  const phoneVal = phone == null || String(phone).trim() === '' ? null : String(phone).trim().slice(0, 30);
+  if (phone == null || String(phone).trim() === '') return { ok: false, reason: 'phone_required' };
+  const phoneVal = normalizePhone(phone);
+  if (!phoneVal) return { ok: false, reason: 'invalid_phone' };
   const nameVal = userName == null || String(userName).trim() === '' ? null : String(userName).trim().slice(0, 30);
   const currentDept = existing ? getUserDeptNo(existing.user_no) : null;
   let deptVal = currentDept;
@@ -1016,8 +1040,8 @@ function upsertUser({ loginId, nickname, phone = null, userName = null, timestam
     if (isNicknameTaken(nick)) return { ok: false, reason: 'nickname_taken' };
     try {
       const info = db.prepare(
-        `INSERT INTO users (login_id, nickname, phone, user_name, created_at, is_deleted, deleted_at, dept_no, password_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO users (login_id, nickname, phone, user_name, created_at, is_deleted, deleted_at, dept_no, password_hash, must_change_password)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
       ).run(id, nick, phoneVal, nameVal, ts, deleted, deleted === 1 ? ts : null, deptVal, hashPassword(defaultPasswordOf(id, phoneVal)));
       return { ok: true, user_no: Number(info.lastInsertRowid) };
     } catch (e) {
@@ -1030,6 +1054,11 @@ function upsertUser({ loginId, nickname, phone = null, userName = null, timestam
   db.prepare(
     `UPDATE users SET nickname = ?, phone = ?, user_name = ?, is_deleted = ?, deleted_at = ?, dept_no = ? WHERE user_no = ?`
   ).run(nick, phoneVal, nameVal, deleted, deleted === 1 ? ts : null, deptVal, existing.user_no);
+  // 아직 초기 비밀번호(변경 강제 상태)인데 전화번호가 바뀌면 초기 비밀번호도 새 번호 기준으로 맞춘다
+  if (phoneVal !== existing.phone && mustChangePassword(existing.user_no)) {
+    db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`)
+      .run(hashPassword(defaultPasswordOf(id, phoneVal)), existing.user_no);
+  }
   return { ok: true, user_no: existing.user_no };
 }
 
@@ -1153,9 +1182,13 @@ function renameUser({ targetNo, newNickname, requesterNo }) {
 // 로그인 비밀번호 확인
 function verifyUserPassword(userNo, password) {
   const no = toUserNo(userNo);
-  if (!no) return false;
-  const row = db.prepare(`SELECT password_hash FROM users WHERE user_no = ?`).get(no);
-  return !!row && verifyPasswordHash(password, row.password_hash);
+  const row = no ? db.prepare(`SELECT password_hash FROM users WHERE user_no = ?`).get(no) : null;
+  // 없는 사용자도 같은 해시 계산을 거쳐 응답 시간으로 아이디 존재 여부가 드러나지 않게 한다
+  if (!row) {
+    verifyPasswordHash(password, DUMMY_PASSWORD_HASH);
+    return false;
+  }
+  return verifyPasswordHash(password, row.password_hash);
 }
 
 // 새 비밀번호 규칙: 8~50자, 영문+숫자 각 1자 이상
@@ -1164,14 +1197,29 @@ function isValidNewPassword(v) {
   return s.length >= 8 && s.length <= 50 && /[A-Za-z]/.test(s) && /\d/.test(s);
 }
 
-// 비밀번호 변경: 본인만, 현재 비밀번호 확인 필수
+// 다음 로그인 때 비밀번호 변경을 강제해야 하는지 (신규 등록 / 초기화 직후)
+function mustChangePassword(userNo) {
+  const no = toUserNo(userNo);
+  if (!no) return false;
+  const row = db.prepare(`SELECT must_change_password FROM users WHERE user_no = ?`).get(no);
+  return !!row && Number(row.must_change_password) === 1;
+}
+
+// 비밀번호 변경: 본인만, 현재 비밀번호 확인 필수.
+// 현재 비밀번호와 같거나, 초기화 직전 비밀번호로 되돌리는 것은 막는다. 성공하면 변경 강제 해제.
 function changePassword({ userNo, currentPassword, newPassword }) {
   const no = toUserNo(userNo);
   if (!no || !getUserByNo(no)) return { ok: false, reason: 'not_found' };
   if (!verifyUserPassword(no, currentPassword)) return { ok: false, reason: 'wrong_current' };
   if (!isValidNewPassword(newPassword)) return { ok: false, reason: 'invalid_new' };
   if (String(newPassword) === String(currentPassword)) return { ok: false, reason: 'same_as_current' };
-  db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`).run(hashPassword(newPassword), no);
+  const row = db.prepare(`SELECT prev_password_hash FROM users WHERE user_no = ?`).get(no);
+  if (row?.prev_password_hash && verifyPasswordHash(newPassword, row.prev_password_hash)) {
+    return { ok: false, reason: 'same_as_previous' };
+  }
+  db.prepare(
+    `UPDATE users SET password_hash = ?, prev_password_hash = NULL, must_change_password = 0 WHERE user_no = ?`
+  ).run(hashPassword(newPassword), no);
   return { ok: true, user_no: no };
 }
 
@@ -1184,7 +1232,13 @@ function resetPassword({ targetNo, requesterNo }) {
   const row = getUserByNo(target);
   if (!row) return { ok: false, reason: 'not_found' };
   const plain = defaultPasswordOf(row.loginId, row.phone);
-  db.prepare(`UPDATE users SET password_hash = ? WHERE user_no = ?`).run(hashPassword(plain), target);
+  // 이미 변경 강제 상태(초기화값 사용 중)면 그 전에 쓰던 비밀번호를 그대로 '직전 비밀번호'로 둔다
+  db.prepare(
+    `UPDATE users
+        SET prev_password_hash = CASE WHEN must_change_password = 1 THEN prev_password_hash ELSE password_hash END,
+            password_hash = ?, must_change_password = 1
+      WHERE user_no = ?`
+  ).run(hashPassword(plain), target);
   return { ok: true, user_no: target, password: plain };
 }
 
@@ -1276,6 +1330,7 @@ module.exports = {
   upsertUser,
   renameUser,
   verifyUserPassword,
+  mustChangePassword,
   changePassword,
   resetPassword,
   setUserProfileImage,

@@ -8,6 +8,7 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
+const { TEST_PHONE, sendJoin } = require('./smoke.auth');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-unread-smoke-'));
 const SMOKE_DB = path.join(tmpDir, 'smoke.db');
@@ -30,7 +31,7 @@ const connect = (loginId) =>
     const ws = new WebSocket(WS_URL);
     const inbox = [];
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', loginId, password: loginId }));
+      sendJoin(ws, loginId);
     });
     ws.on('message', (raw) => {
       try { inbox.push(JSON.parse(String(raw))); } catch { /* 무시 */ }
@@ -65,7 +66,7 @@ const connect = (loginId) =>
 // admin 으로 사용자 등록 후 user_no 를 돌려준다
 const register = async (admin, loginId, nickname) => {
   admin.inbox.length = 0;
-  admin.send({ type: 'user_upsert', loginId, nickname, isDeleted: false });
+  admin.send({ type: 'user_upsert', phone: TEST_PHONE, loginId, nickname, isDeleted: false });
   const r = await admin.waitFor((m) => m.type === 'user_upsert_result');
   if (r.ok !== true) throw new Error(`사용자 등록 실패: ${loginId} (${r.reason})`);
   return r.user_no;

@@ -20,7 +20,7 @@ const assert = (cond, msg) => {
 try {
   const now = Date.now();
   const register = (loginId, nickname) => {
-    const r = d.upsertUser({ loginId, nickname, timestamp: now, isDeleted: false });
+    const r = d.upsertUser({ loginId, nickname, phone: '010-0000-1234', timestamp: now, isDeleted: false });
     assert(r.ok, `사용자 등록: ${nickname}`);
     return r.user_no;
   };

@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
+const { TEST_PHONE, sendJoin } = require('./smoke.auth');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-attach-'));
 const SMOKE_DB = path.join(tmpDir, 'smoke.db');
@@ -20,7 +21,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const connect = (loginId) => new Promise((resolve, reject) => {
   const ws = new WebSocket(WS_URL);
   const inbox = [];
-  ws.on('open', () => ws.send(JSON.stringify({ type: 'join', loginId, password: loginId })));
+  ws.on('open', () => sendJoin(ws, loginId));
   ws.on('message', (raw) => { try { inbox.push(JSON.parse(String(raw))); } catch { /* 무시 */ } });
   ws.on('error', reject);
   const waitFor = (pred, timeout = 5000) => new Promise((res, rej) => {
@@ -59,7 +60,7 @@ const upload = async (name, mime, bytes) => {
     await wait(1000);
 
     const a = await connect('admin'); clients.push(a); await a.ready;
-    a.send({ type: 'user_upsert', loginId: 'root', nickname: 'root', isDeleted: false });
+    a.send({ type: 'user_upsert', phone: TEST_PHONE, loginId: 'root', nickname: 'root', isDeleted: false });
     const reg = await a.waitFor((m) => m.type === 'user_upsert_result');
     const rootNo = reg.user_no;
     const b = await connect('root'); clients.push(b); await b.ready;

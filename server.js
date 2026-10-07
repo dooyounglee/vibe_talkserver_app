@@ -39,6 +39,7 @@ const {
   upsertUser,
   renameUser,
   verifyUserPassword,
+  mustChangePassword,
   changePassword,
   resetPassword,
   setUserProfileImage,
@@ -188,6 +189,9 @@ server.listen(PORT);
 
 // 클라이언트별 user_no 저장 (WebSocket 인스턴스 -> user_no)
 const clients = new Map();
+// 비밀번호 변경 강제 대기 중인 소켓 → user_no.
+// clients에 넣지 않으므로 password_change 외의 요청(myUserNo 기반)은 모두 무시된다.
+const pendingPasswordChange = new Map();
 // 소켓별 입장 방 집합 (발송 스코프용 캐시, 권한 판정은 항상 DB 기준)
 const wsRooms = new Map();
 
@@ -358,6 +362,33 @@ function broadcastDeptList() {
 }
 
 // 그룹 채팅 기록 조회 — 전체채팅 제거로 더 이상 사용하지 않음 (기존 DB 행은 보존)
+// 입장 확정: 비밀번호 확인(및 필요 시 강제 변경)을 마친 소켓을 접속자로 등록하고 초기 상태를 보낸다
+function completeJoin(ws, user) {
+  clients.set(ws, user.user_no);
+  // 재접속 시 상태 기본값은 online (이전 접속에서 남은 override 제거)
+  statusOverrides.delete(Number(user.user_no));
+  console.log(`user_no=${user.user_no}(${user.nickname}) 입장`);
+
+  trackClear(ws);
+  const myRooms = getMyRooms(user.user_no);
+  for (const r of myRooms) trackJoin(ws, r.roomId);
+
+  // 개인 응답을 먼저 보낸다 — join_ok를 userlist보다 먼저 보내야
+  // 클라이언트가 myUserNo를 설정한 상태에서 사용자 목록을 처리할 수 있다.
+  // (join_ok에 표시용 닉네임 포함 — 클라는 user_no를 키로, nickname을 표시로 쓴다)
+  ws.send(JSON.stringify({ type: 'join_ok', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname, profileImage: user.profileImage }));
+  ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
+  ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(user.user_no) }));
+  if (isAdminNo(user.user_no)) {
+    ws.send(JSON.stringify({ type: 'userlist_detail', usersDetail: getAllUsersDetail() }));
+    sendDeptList(ws);
+  }
+
+  // 이후 브로드캐스트 — 입장 인사 + 사용자 목록 갱신
+  broadcast({ type: 'system', text: `${user.nickname}님이 입장했습니다` });
+  broadcastUserList();
+}
+
 // function getRecentGroupHistory() — deleted
 
 // 접속 시 DM 기록 일괄 전송도 제거 — 채팅창 열람 시 dm_history 요청으로 대체
@@ -379,41 +410,26 @@ wss.on('connection', (ws) => {
           return;
         }
         const user = getUserByLoginId(loginId);
-        if (!user) {
-          ws.send(JSON.stringify({ type: 'join_failed', reason: 'not_registered', text: '등록된 사용자가 아닙니다. 관리자에게 문의하세요' }));
-          return;
-        }
-        if (!verifyUserPassword(user.user_no, String(data.password ?? ''))) {
-          ws.send(JSON.stringify({ type: 'join_failed', reason: 'wrong_password', text: '비밀번호가 올바르지 않습니다.' }));
+        // 없는 아이디와 틀린 비밀번호는 같은 문구로 응답한다 (아이디 존재 여부 노출 방지)
+        const passwordOk = verifyUserPassword(user?.user_no, String(data.password ?? ''));
+        if (!user || !passwordOk) {
+          ws.send(JSON.stringify({ type: 'join_failed', reason: 'invalid_credentials', text: '아이디 또는 비밀번호가 올바르지 않습니다.' }));
           return;
         }
         if (user.isDeleted) {
           ws.send(JSON.stringify({ type: 'join_failed', reason: 'withdrawn', text: '탈퇴한 사용자입니다' }));
           return;
         }
-        clients.set(ws, user.user_no);
-        // 재접속 시 상태 기본값은 online (이전 접속에서 남은 override 제거)
-        statusOverrides.delete(Number(user.user_no));
-        console.log(`user_no=${user.user_no}(${user.nickname}) 입장`);
-
-        trackClear(ws);
-        const myRooms = getMyRooms(user.user_no);
-        for (const r of myRooms) trackJoin(ws, r.roomId);
-
-        // 개인 응답을 먼저 보낸다 — join_ok를 userlist보다 먼저 보내야
-        // 클라이언트가 myUserNo를 설정한 상태에서 사용자 목록을 처리할 수 있다.
-        // (join_ok에 표시용 닉네임 포함 — 클라는 user_no를 키로, nickname을 표시로 쓴다)
-        ws.send(JSON.stringify({ type: 'join_ok', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname, profileImage: user.profileImage }));
-        ws.send(JSON.stringify({ type: 'my_rooms', rooms: myRooms }));
-        ws.send(JSON.stringify({ type: 'unread_state', unread: getUnreadMap(user.user_no) }));
-        if (isAdminNo(user.user_no)) {
-          ws.send(JSON.stringify({ type: 'userlist_detail', usersDetail: getAllUsersDetail() }));
-          sendDeptList(ws);
+        // 신규 등록 / 초기화 직후: 비밀번호를 바꿀 때까지 입장시키지 않는다
+        if (mustChangePassword(user.user_no)) {
+          clients.delete(ws);
+          trackClear(ws);
+          pendingPasswordChange.set(ws, user.user_no);
+          ws.send(JSON.stringify({ type: 'password_change_required', user_no: user.user_no, loginId: user.loginId, nickname: user.nickname }));
+          return;
         }
-
-        // 이후 브로드캐스트 — 입장 인사 + 사용자 목록 갱신
-        broadcast({ type: 'system', text: `${user.nickname}님이 입장했습니다` });
-        broadcastUserList();
+        pendingPasswordChange.delete(ws);
+        completeJoin(ws, user);
       }
 
       // ─── 내 상태 전파: 드롭다운에서 고른 상태를 전체에 알린다 ───
@@ -452,6 +468,8 @@ wss.on('connection', (ws) => {
             nickname_taken: '이미 사용 중인 닉네임입니다. (탈퇴 포함)',
             admin_protected: 'admin은 변경할 수 없습니다.',
             invalid_dept: '사용 중인 부서만 선택할 수 있습니다.',
+            phone_required: '전화번호를 입력하세요.',
+            invalid_phone: '전화번호 형식이 올바르지 않습니다. (예: 010-1234-5678)',
           };
           ws.send(JSON.stringify({ type: 'user_upsert_result', ok: false, reason: result.reason, text: texts[result.reason] || '사용자 저장에 실패했습니다' }));
           return;
@@ -530,7 +548,8 @@ wss.on('connection', (ws) => {
       // ─── 비밀번호 변경 (본인) ───
       // { currentPassword, newPassword } — 새 비밀번호는 8~50자 영문+숫자 조합
       else if (data.type === 'password_change') {
-        const me = myUserNo(ws);
+        const pendingNo = pendingPasswordChange.get(ws);
+        const me = myUserNo(ws) ?? pendingNo;
         if (!me) return;
         const result = changePassword({
           userNo: me,
@@ -543,11 +562,17 @@ wss.on('connection', (ws) => {
             wrong_current: '현재 비밀번호가 올바르지 않습니다.',
             invalid_new: '새 비밀번호는 영문과 숫자를 포함해 8~50자로 입력하세요.',
             same_as_current: '현재 비밀번호와 다른 비밀번호를 입력하세요.',
+            same_as_previous: '초기화 전 비밀번호와 다른 비밀번호를 입력하세요.',
           };
           ws.send(JSON.stringify({ type: 'password_change_result', ok: false, reason: result.reason, text: texts[result.reason] || '비밀번호 변경에 실패했습니다' }));
           return;
         }
         ws.send(JSON.stringify({ type: 'password_change_result', ok: true }));
+        // 변경 강제 대기 중이었으면 이제 입장시킨다
+        if (pendingNo) {
+          pendingPasswordChange.delete(ws);
+          completeJoin(ws, getUserByNo(pendingNo));
+        }
       }
 
       // ─── 비밀번호 초기화 (본인 + admin) ───
@@ -1157,6 +1182,7 @@ wss.on('connection', (ws) => {
   
   // 클라이언트 연결 종료 시 (멤버십 유지 — 재접속 시 내방 복원)
   ws.on('close', () => {
+    pendingPasswordChange.delete(ws);
     const no = myUserNo(ws);
     if (no) {
       clients.delete(ws);

@@ -24,7 +24,7 @@ try {
   const nickOf = {};
   const noOf = {};
   const register = (loginId, nickname) => {
-    const r = d.upsertUser({ loginId, nickname, timestamp: now, isDeleted: false });
+    const r = d.upsertUser({ loginId, nickname, phone: '010-0000-1234', timestamp: now, isDeleted: false });
     assert(r.ok, `사용자 등록: ${nickname}`);
     nickOf[r.user_no] = nickname;
     noOf[nickname] = r.user_no;
